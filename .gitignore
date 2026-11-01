@@ -1,0 +1,5 @@
+# Locally compiled executable and build outputs
+/smcled
+/.build/
+*.dSYM/
+.DS_Store
