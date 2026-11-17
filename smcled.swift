@@ -201,7 +201,7 @@ func signatureMatches(_ actual: [String: KeyInfo],
 
 func compatibilityLevel(_ model: String, _ keys: [String: KeyInfo]) -> CompatibilityLevel {
     let full = signatureMatches(keys, specs: fullSignature)
-    if model == "Macmini9,1" && full { return .verified }
+    if physicallyTestedDesktops.contains(model) && full { return .verified }
     if full { return .fullCandidate }
     if signatureMatches(keys, specs: brightnessSignature) { return .brightnessCandidate }
     return .unavailable
@@ -241,13 +241,15 @@ func reportCompatibility() throws {
         }
     }
     if level == .verified {
-        print("Standard LED commands are enabled for Macmini9,1.")
+        print("Standard LED commands available on the physically tested model.")
     } else if level == .unavailable {
         print("LED writes are blocked: required brightness metadata unavailable.")
+    } else if supportedAppleSiliconDesktops.contains(model) && level == .fullCandidate {
+        print("Untested Apple Silicon desktop: normal commands require --accept-untested-model.")
+        print("Matching metadata does not prove physical LED behavior.")
     } else {
-        print("Only the explicitly confirmed temporary brightness test is available.")
-        print("SMC metadata cannot prove physical LED response or amber support.")
-        print("Normal LED writes and installation remain restricted to Macmini9,1.")
+        print("Only explicit temporary diagnostics are available; normal LED writes are blocked.")
+        print("Matching metadata does not prove physical LED behavior.")
     }
 }
 
@@ -286,7 +288,11 @@ func compatibilitySelfTest() throws {
     invalid["LSLN"] = key(2, "ui16", 0x80) // read-only: no safe brightness test
     let cases: [(String, [String: KeyInfo], CompatibilityLevel)] = [
         ("Macmini9,1", full, .verified),
-        ("Mac16,9", full, .fullCandidate),
+        ("Mac16,9", full, .verified),
+        ("Mac14,3", full, .fullCandidate),
+        ("Mac16,11", full, .fullCandidate),
+        ("Mac13,2", full, .fullCandidate),
+        ("Mac15,14", full, .fullCandidate),
         ("Macmini8,1", reduced, .brightnessCandidate),
         ("Macmini9,1", reduced, .brightnessCandidate),
         ("Mac16,9", invalid, .unavailable),
@@ -327,6 +333,32 @@ func requireRoot() throws {
 func requireM1Mini() throws {
     guard modelID() == "Macmini9,1" else {
         throw ToolError("LED changes are only verified on Macmini9,1 (found \(modelID()))")
+    }
+}
+
+// Apple-published model identifiers for Apple Silicon Mac mini and Mac Studio.
+// Only Macmini9,1 and Mac16,9 have physically confirmed LED behavior.
+private let supportedAppleSiliconDesktops: Set<String> = [
+    "Macmini9,1", "Mac14,3", "Mac14,12", "Mac16,10", "Mac16,11",
+    "Mac13,1", "Mac13,2", "Mac14,13", "Mac14,14", "Mac15,14", "Mac16,9"
+]
+private let physicallyTestedDesktops: Set<String> = ["Macmini9,1", "Mac16,9"]
+
+func requireSupportedLEDHost() throws {
+    let model = modelID()
+    guard supportedAppleSiliconDesktops.contains(model) else {
+        if model == "Macmini8,1" {
+            throw ToolError("Intel Mac mini has an unverified LSLN=2F FF encoding. Use --test-intel-brightness for a reversible experiment; normal LED commands stay disabled")
+        }
+        throw ToolError("Unverified Mac model \(model). No SMC writes allowed. Check --compatibility and request a reviewed profile for newer models")
+    }
+    let smc = try SMC()
+    guard signatureMatches(readCompatibilityKeys(smc), specs: fullSignature) else {
+        throw ToolError("SMC LED key metadata differs from the supported profile on \(model); refusing writes")
+    }
+    guard physicallyTestedDesktops.contains(model) ||
+          CommandLine.arguments.contains("--accept-untested-model") else {
+        throw ToolError("\(model) is an untested Apple Silicon desktop. LED behavior may differ. Rerun with --accept-untested-model after reviewing the warning")
     }
 }
 
@@ -400,7 +432,7 @@ func restoreWhiteChannel(_ smc: SMC) throws {
 // Brightness on flashing amber presets is plausible but not yet hardware verified.
 func applyKnownLED(_ smc: SMC, mode: LEDMode, brightness: UInt8? = nil) throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost()
     try checkLEDKeys(smc, includeModes: true)
     switch mode {
     case .white:
@@ -419,7 +451,7 @@ func applyKnownLED(_ smc: SMC, mode: LEDMode, brightness: UInt8? = nil) throws {
 // The legacy quick brightness operation is explicitly a white-mode operation.
 func setKnownLEDBrightness(_ brightness: UInt8) throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost()
     let smc = try SMC()
     try applyKnownLED(smc, mode: .white, brightness: brightness)
 }
@@ -535,10 +567,11 @@ func jobIsLoaded() -> Bool {
     (try? callLaunchctl(["print", "system/" + jobLabel], quiet: true)) == 0
 }
 
-func createPlistData(automatic: Bool = false, interval: Int = 300) throws -> Data {
+func createPlistData(automatic: Bool = false, interval: Int = 300, acknowledged: Bool = false) throws -> Data {
+    let args = [installedExecutable, "--apply-installed"] + (acknowledged ? ["--accept-untested-model"] : [])
     var settings: [String: Any] = [
         "Label": jobLabel,
-        "ProgramArguments": [installedExecutable, "--apply-installed"],
+        "ProgramArguments": args,
         "RunAtLoad": true,
         "ProcessType": "Background"
     ]
@@ -555,7 +588,7 @@ func writeManagedFile(_ path: String, data: Data, executable: Bool = false) thro
 
 func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: Bool = false, interval: Int = 300) throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost()
     // Validate solar-time source before modifying a previously working installation.
     if automatic { _ = try calculateAutoPlan(at: Date()) }
     // Check access and metadata before touching the installation.
@@ -592,7 +625,7 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     }
     try writeManagedFile(brightnessPreference, data: Data("\(brightness)\n".utf8))
     try writeManagedFile(modePreference, data: Data("\(automatic ? "auto" : mode.rawValue)\n".utf8))
-    try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval))
+    try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval, acknowledged: !physicallyTestedDesktops.contains(modelID())))
     try installCLILink()
     // A previously disabled service must be re-enabled explicitly.
     _ = try callLaunchctl(["enable", "system/" + jobLabel])
@@ -650,7 +683,7 @@ func preferredBrightnessOrDefault() throws -> UInt8 {
 
 func applyInstalledBrightness() throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost()
     let brightness = try readInstalledBrightness()
     let modeName = try readInstalledModeName()
     // The SMC may not be ready at the first instant launchd loads us.
@@ -734,7 +767,7 @@ func installationStatus() throws {
         }
         else { print("Configured brightness: \(try readInstalledBrightness())") }
     }
-    if modelID() == "Macmini9,1" {
+    if supportedAppleSiliconDesktops.contains(modelID()) {
         let smc = try SMC()
         print("Current LSLN raw: \(hex(try smc.read("LSLN")))")
         print("Current LSCS (channel): \(hex(try smc.read("LSCS")))")
@@ -1429,7 +1462,7 @@ func fadeBrightness(_ smc: SMC, from start: UInt8, to end: UInt8,
 
 func applyAutomaticLED(_ smc: SMC) throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost()
     try checkLEDKeys(smc, includeModes: true)
     let target = try calculateAutoPlan(at: Date()).target
     let current = try readLEDOutput(smc)
@@ -1584,7 +1617,8 @@ func ledBytes(_ value: UInt8, mode: String) -> [UInt8] {
     mode == "vv" ? [value, value] : [value, 0]
 }
 
-func run(_ arguments: [String]) throws {
+func run(_ originalArguments: [String]) throws {
+    let arguments = originalArguments.filter { $0 != "--accept-untested-model" }
     guard let command = arguments.first else { usage(); return }
     if ["--help", "help", "-h"].contains(command) { usage(); return }
     if command == "model" { print(modelID()); return }
@@ -1631,7 +1665,7 @@ func run(_ arguments: [String]) throws {
     case "--auto-check":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --auto-check") }
         try requireRoot()
-        try requireM1Mini()
+        try requireSupportedLEDHost()
         try applyAutomaticLED(SMC())
         return
     case "--install-auto":
