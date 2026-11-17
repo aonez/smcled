@@ -1035,13 +1035,58 @@ final class DiagnosticCancellation: @unchecked Sendable {
 // symmetric brightness encoding confirmed on Apple Silicon. This diagnostic
 // changes only the second byte, for two seconds, restoring both original bytes.
 // It does not grant ordinary LED operations on this Intel model.
-func testIntelBrightnessCandidate(_ candidate: UInt8) throws {
+// Intel 2018 exploratory diagnostics. No SMC key other than LSLN is ever
+// written. The observed baseline 2F FF is a hard prerequisite, NOT a known
+// brightness encoding. First-byte writes are unverified and potentially risky.
+enum IntelLSLNByte: String {
+    case first
+    case second
+}
+
+struct IntelLSLNExperiment {
+    let byte: IntelLSLNByte
+    let value: UInt8
+    let label: String
+}
+
+func intelProposedBytes(_ baseline: [UInt8], experiment: IntelLSLNExperiment) -> [UInt8] {
+    var proposed = baseline
+    switch experiment.byte {
+    case .first: proposed[0] = experiment.value
+    case .second: proposed[1] = experiment.value
+    }
+    return proposed
+}
+
+// Read-only before/after key inventory. Missing keys are normal and are
+// reported explicitly; write-only keys are never read.
+func intelLEDReadout(_ smc: SMC, heading: String) {
+    print(heading)
+    for key in ["LSLN", "LSLB", "LSLF", "LS0C", "LS0P", "LS0S",
+                "LS1C", "LS1P", "LS1S", "LSCS", "LSOF", "LSSE"] {
+        do {
+            let info = try smc.info(key)
+            guard info.readable, info.size > 0, info.size <= 32 else {
+                print("  \(key): present, not readable")
+                continue
+            }
+            let bytes = try smc.read(key)
+            print("  \(key): \(hex(bytes))")
+        } catch {
+            print("  \(key): unavailable")
+        }
+    }
+}
+
+// Return a vetted experimental context. The Intel SMC uses different data
+// than the known Apple Silicon profile; we do not reuse its color controls.
+func intelTestContext() throws -> (SMC, [UInt8]) {
     try requireRoot()
     guard modelID() == "Macmini8,1" else {
-        throw ToolError("This diagnostic is only for Macmini8,1")
+        throw ToolError("Intel diagnostics are restricted to the Macmini8,1")
     }
     guard !jobIsLoaded() else {
-        throw ToolError("Stop the smcled LaunchDaemon before an experimental Intel test")
+        throw ToolError("Stop the smcled LaunchDaemon before Intel experiments")
     }
     let smc = try SMC()
     let info = try smc.info("LSLN")
@@ -1052,29 +1097,104 @@ func testIntelBrightnessCandidate(_ candidate: UInt8) throws {
     guard original == [0x2F, 0xFF] else {
         throw ToolError("Expected observed Intel baseline 2F FF; got \(hex(original)). No write attempted")
     }
-    guard candidate != 255 else {
-        throw ToolError("Choose a candidate different from original second byte 255")
+    return (smc, original)
+}
+
+// This function is shared by the individual test and test suite. Restoration
+// is performed before returning; any failed readback aborts the sequence.
+func runIntelLSLNStep(_ smc: SMC, original: [UInt8],
+                      experiment: IntelLSLNExperiment,
+                      cancellation: DiagnosticCancellation) throws {
+    guard original == [0x2F, 0xFF] else { throw ToolError("Unexpected Intel baseline") }
+    try cancellation.check()
+    let before = try smc.read("LSLN")
+    guard before == original else {
+        throw ToolError("Intel LSLN changed unexpectedly to \(hex(before)); aborting")
     }
+    let requested = intelProposedBytes(original, experiment: experiment)
+    guard requested != original else { throw ToolError("Test value is identical to original") }
+    print("TEST \(experiment.label): \(hex(original)) -> \(hex(requested)) for 2 seconds")
+    // Arm restoration before the first write, including if SMC rejects it.
+    // A crash, SIGKILL, or sudden power loss cannot trigger this cleanup.
+    var restorationError: Error?
+    do {
+        try smc.write("LSLN", bytes: requested)
+        let observed = try smc.read("LSLN")
+        print("  SMC readback: \(hex(observed))")
+        try cancellation.pause(2.0)
+    } catch {
+        restorationError = error
+    }
+    // Always restore, independently of the preceding test result.
+    do {
+        try smc.write("LSLN", bytes: original)
+        let restored = try smc.read("LSLN")
+        print("  Restored LSLN: \(hex(restored))")
+        guard restored == original else {
+            throw ToolError("Intel LSLN restore mismatch; expected \(hex(original)), got \(hex(restored)). STOP")
+        }
+    } catch {
+        writeStderr("WARNING: Intel LSLN restoration failed: \(error)\n")
+        throw error
+    }
+    if let restorationError { throw restorationError }
+    print("  Visual result: compare LED brightness manually; no automatic confirmation.")
+}
+
+func runIntelLSLNExperiments(_ experiments: [IntelLSLNExperiment]) throws {
+    let (smc, original) = try intelTestContext()
     let cancellation = DiagnosticCancellation()
-    print("EXPERIMENTAL Macmini8,1 LSLN test: preserve first byte 2F, change second byte FF -> " +
-          String(format: "%02X", candidate) + " for 2 seconds.")
-    print("SMC meaning is unverified. Watch the physical LED. Restoring original 2F FF afterward.")
+    print("EXPERIMENTAL Macmini8,1 LSLN tests. Original register \(hex(original)).")
+    print("The byte meanings are UNKNOWN. First-byte changes are UNTESTED.")
+    print("Only LSLN is written, never LSSB, LSRB, or channel configuration keys.")
+    print("If an interrupted test leaves the LED changed, stop and investigate.")
+    intelLEDReadout(smc, heading: "Before tests (read only):")
+    // Final fallback even if a stage fails. This must not replace the
+    // per-stage restoration/verification above.
     defer {
         do {
-            try smc.write("LSLN", bytes: original)
-            let restored = try smc.read("LSLN")
-            print("Restored LSLN=\(hex(restored))")
-            if restored != original {
-                writeStderr("WARNING: Intel brightness readback differs from original!\n")
+            let current = try smc.read("LSLN")
+            if current != original {
+                try smc.write("LSLN", bytes: original)
+                print("Final fallback restore: \(hex(try smc.read("LSLN")))")
             }
         } catch {
-            writeStderr("WARNING: could not restore original Intel LSLN: \(error)\n")
+            writeStderr("WARNING: Final Intel LSLN restoration failed: \(error)\n")
         }
     }
-    try cancellation.check()
-    try smc.write("LSLN", bytes: [original[0], candidate])
-    print("Test LSLN=\(hex(try smc.read("LSLN")))")
-    try cancellation.pause(2.0)
+    for (index, experiment) in experiments.enumerated() {
+        print("Step \(index + 1)/\(experiments.count)")
+        try runIntelLSLNStep(smc, original: original,
+                             experiment: experiment, cancellation: cancellation)
+        intelLEDReadout(smc, heading: "After step \(index + 1) (read only):")
+        if index + 1 < experiments.count { try cancellation.pause(0.75) }
+    }
+    print("Intel diagnostics complete; no persistent setting was installed.")
+}
+
+func intelReadOnlyDiagnostics() throws {
+    guard modelID() == "Macmini8,1" else {
+        throw ToolError("Intel diagnostics are restricted to Macmini8,1")
+    }
+    let smc = try SMC()
+    intelLEDReadout(smc, heading: "Macmini8,1 LED-related SMC snapshot (read only):")
+}
+
+func intelSuite() throws {
+    // Conservative first-byte variations around the observed value 0x2F.
+    // The second-byte variation is included as a reproducibility control.
+    try runIntelLSLNExperiments([
+        IntelLSLNExperiment(byte: .first, value: 0x20, label: "first byte 2F -> 20"),
+        IntelLSLNExperiment(byte: .first, value: 0x40, label: "first byte 2F -> 40"),
+        IntelLSLNExperiment(byte: .second, value: 0x64, label: "second byte FF -> 64 (prior no visible effect)")
+    ])
+}
+
+// Legacy command retained, using the same step engine as all new tests.
+func testIntelBrightnessCandidate(_ candidate: UInt8) throws {
+    try runIntelLSLNExperiments([
+        IntelLSLNExperiment(byte: .second, value: candidate, label: "second byte")
+    ])
 }
 
 func testBrightnessCandidate(_ candidate: UInt8) throws {
@@ -1608,8 +1728,14 @@ func usage() {
 
       smcled --compatibility             Read-only hardware capability report
       smcled --sample-brightness         Read LSLN repeatedly, without writes
+      smcled --intel-snapshot              Read-only Intel SMC LED key inventory
+      sudo smcled --intel-suite --confirm-hardware-test
+                                          Three reversible Intel LSLN tests
+      sudo smcled --intel-probe first 32 --confirm-hardware-test
+      sudo smcled --intel-probe second 100 --confirm-hardware-test
+                                          Select byte and value without recompiling
       sudo smcled --test-intel-brightness 100 --confirm-hardware-test
-                                          Reversible research probe on Macmini8,1
+                                          Legacy second-byte test on Macmini8,1
       --accept-untested-model             Acknowledge untested Apple Silicon model
       smcled --compatibility-self-test   Offline signature classification tests
       sudo smcled --test-brightness 100 --confirm-hardware-test
@@ -1675,6 +1801,27 @@ func run(_ originalArguments: [String]) throws {
     case "--compatibility":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility") }
         try reportCompatibility()
+        return
+    case "--intel-snapshot":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-snapshot") }
+        try intelReadOnlyDiagnostics()
+        return
+    case "--intel-suite":
+        guard arguments.count == 2, arguments[1] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --intel-suite --confirm-hardware-test")
+        }
+        try intelSuite()
+        return
+    case "--intel-probe":
+        guard arguments.count == 4,
+              let byte = IntelLSLNByte(rawValue: arguments[1]),
+              arguments[3] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --intel-probe <first|second> <0...255> --confirm-hardware-test")
+        }
+        try runIntelLSLNExperiments([
+            IntelLSLNExperiment(byte: byte, value: try brightnessNumber(arguments[2]),
+                                 label: "(byte.rawValue) byte")
+        ])
         return
     case "--test-intel-brightness":
         guard arguments.count == 3, arguments[2] == "--confirm-hardware-test" else {
