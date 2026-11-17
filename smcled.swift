@@ -798,6 +798,83 @@ func testAmberChannel(mode: UInt8) throws {
 // register affects the already active amber channel. Does not claim that it does.
 // Starts in normal white mode, applies fixed amber, samples its PWM, then writes
 // one LSLN value and observes amber PWM. Restores the original state on return.
+// Opt-in candidate test: the Mac Studio's white LED brightness is physically
+// verified, but LSSB/LSRB channel behavior has not yet been confirmed.
+// This test is intentionally restricted to Mac16,9 and never installs a job.
+func testStudioAmberCandidate() throws {
+    try requireRoot()
+    guard modelID() == "Mac16,9" else {
+        throw ToolError("This diagnostic is restricted to the Mac16,9 Mac Studio")
+    }
+    guard !jobIsLoaded() else {
+        throw ToolError("Stop the smcled LaunchDaemon before experimenting with LED modes")
+    }
+    let smc = try SMC()
+    guard signatureMatches(readCompatibilityKeys(smc), specs: fullSignature) else {
+        throw ToolError("Required LED key metadata differs from the tested SMC profile")
+    }
+    let initial = try readLEDOutput(smc)
+    guard initial.selection == [0], initial.amberPWM == [0, 0],
+          initial.whiteActive, initial.brightness.count == 2,
+          initial.brightness[0] == initial.brightness[1] else {
+        throw ToolError("Expected normal white LED with symmetric brightness; no writes attempted")
+    }
+    let cancellation = DiagnosticCancellation()
+    print("Mac16,9 amber candidate test (not previously hardware verified).")
+    print("Initial LSCS=\(hex(initial.selection)) LS0P=\(hex(initial.whitePWM))" +
+          " LS1P=\(hex(initial.amberPWM)) LSLN=\(hex(initial.brightness))")
+    print("Will dim to zero, apply LSSB mode 4, briefly show candidate amber at 100," +
+          " then restore normal white. Observe the physical LED.")
+    // Arm restoration before any writes. If a write fails or a handled signal is
+    // received, attempt the independent restoration steps anyway. SIGKILL,
+    // process crashes, and power failures still cannot be recovered in-process.
+    defer {
+        print("Restoring original white state...")
+        do { try smc.write("LSLN", bytes: [0, 0]) }
+        catch { writeStderr("WARNING: could not blank LED for restoration: \(error)\n") }
+        do { try restoreWhiteChannel(smc) }
+        catch { writeStderr("WARNING: white mode restore failed: \(error)\n") }
+        do { try smc.write("LSLN", bytes: initial.brightness) }
+        catch { writeStderr("WARNING: original brightness restore failed: \(error)\n") }
+        do {
+            let restored = try readLEDOutput(smc)
+            print("Restored LSCS=\(hex(restored.selection)) LS0P=\(hex(restored.whitePWM))" +
+                  " LS1P=\(hex(restored.amberPWM)) LSLN=\(hex(restored.brightness))")
+            if restored.selection != initial.selection ||
+               restored.amberPWM != [0, 0] ||
+               restored.brightness != initial.brightness {
+                writeStderr("WARNING: post-test LED state differs from initial state\n")
+            }
+        } catch { writeStderr("WARNING: restoration readback failed: \(error)\n") }
+    }
+    try cancellation.check()
+    try smc.write("LSLN", bytes: [0, 0])
+    try cancellation.pause(0.35)
+    try smc.write("LSSB", bytes: [4, 0])
+    try cancellation.pause(0.4)
+    let selected = try readLEDOutput(smc)
+    print("Mode 4 LSCS=\(hex(selected.selection)) LS0P=\(hex(selected.whitePWM))" +
+          " LS1P=\(hex(selected.amberPWM)) LSLN=\(hex(selected.brightness))")
+    guard selected.selection == [1], selected.whitePWM == [0, 0] else {
+        print("SMC channel response differs from M1. Stopping before illuminating amber.")
+        return
+    }
+    try cancellation.check()
+    try smc.write("LSLN", bytes: [100, 100])
+    try cancellation.pause(1.5)
+    let amber = try readLEDOutput(smc)
+    print("Candidate amber LSCS=\(hex(amber.selection))" +
+          " LS0P=\(hex(amber.whitePWM)) LS1P=\(hex(amber.amberPWM))" +
+          " LSLN=\(hex(amber.brightness))")
+    if amber.selection == [1] && amber.whitePWM == [0, 0] &&
+       amber.amberActive && amber.brightness == [100, 100] {
+        print("SMC telemetry matches amber mode. Physical color must be confirmed visually.")
+    } else {
+        print("SMC telemetry does not confirm the M1-style amber mode.")
+    }
+    try cancellation.check()
+}
+
 func testAmberBrightness(_ candidate: UInt8) throws {
     try requireRoot()
     try requireM1Mini()
@@ -1455,6 +1532,8 @@ func usage() {
       smcled --compatibility-self-test   Offline signature classification tests
       sudo smcled --test-brightness 100 --confirm-hardware-test
                                           Reversible LSLN probe on candidate models
+      sudo smcled --test-studio-amber --confirm-hardware-test
+                                          Reversible steady amber probe on Mac16,9
       smcled model                       Print hardware identifier
       smcled read <FOURCC>               Read an SMC key
       smcled info <FOURCC>               Read key metadata
@@ -1521,6 +1600,12 @@ func run(_ arguments: [String]) throws {
     case "--compatibility-self-test":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility-self-test") }
         try compatibilitySelfTest()
+        return
+    case "--test-studio-amber":
+        guard arguments.count == 2, arguments[1] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --test-studio-amber --confirm-hardware-test")
+        }
+        try testStudioAmberCandidate()
         return
     case "--test-brightness":
         guard arguments.count == 3, arguments[2] == "--confirm-hardware-test" else {
