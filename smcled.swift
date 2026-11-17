@@ -1,4 +1,4 @@
-// smcled.swift — AppleSMC power LED CLI for the M1 Mac mini
+// smcled.swift — AppleSMC power LED CLI for Apple Silicon Mac mini and Studio
 // No Apple-private headers, third-party dependencies, kext, or SIP changes.
 // Verified on Macmini9,1: white PWM and three amber presets.
 // Confirmed: LSLN controls brightness on steady amber (tested at 10 and 50).
@@ -1577,7 +1577,7 @@ func testZeroBrightness() throws {
 
 func usage() {
     print("""
-    smcled — AppleSMC status LED CLI for M1 Mac mini (Macmini9,1)
+    smcled — AppleSMC status LED CLI for Mac mini and Mac Studio
 
       sudo smcled 10                      White at brightness 10
       sudo smcled --white [0...255]      White; optional brightness (current if omitted)
