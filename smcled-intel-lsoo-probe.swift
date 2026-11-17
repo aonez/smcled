@@ -216,16 +216,30 @@ func test(_ smc: SMC, command: UInt8, cancellation: Cancellation) throws {
     } catch { stepError = error }
     do {
         try smc.write("LSRB", bytes: [0])
-        try cancellation.pause(0.5)
-        print("  After LSRB: LSPV=\(hex(try smc.read("LSPV"))) LSOF=\(hex(try smc.read("LSOF")))")
-        let status = try smc.read("LSOF")
-        let pwm = try smc.read("LSPV")
-        guard status == [0], pwm == originalPWM,
-              try smc.read("LSLN") == [0x2F, 0xFF],
-              try smc.read("LS! ") == [0] else {
-            throw TestError("SMC did not return to baseline after LSRB (LSOF=\(hex(status)), LSPV=\(hex(pwm))); STOP")
+        // On the Intel T2 mini the output visibly fades back on; a read
+        // 0.5s after LSRB is often still mid-ramp, not a restoration failure.
+        // Poll for up to 6 seconds, without treating the expected fade as an
+        // error or interrupting restoration on SIGINT/SIGTERM.
+        let deadline = Date().addingTimeInterval(6.0)
+        var lastStatus = [UInt8]()
+        var lastPWM = [UInt8]()
+        var restored = false
+        repeat {
+            lastStatus = try smc.read("LSOF")
+            lastPWM = try smc.read("LSPV")
+            print("  Restoring: LSPV=\(hex(lastPWM)) LSOF=\(hex(lastStatus))")
+            if lastStatus == [0], lastPWM == originalPWM,
+               try smc.read("LSLN") == [0x2F, 0xFF],
+               try smc.read("LS! ") == [0] {
+                restored = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < deadline
+        guard restored else {
+            throw TestError("LSRB restoration not confirmed within 6s (LSOF=\(hex(lastStatus)), LSPV=\(hex(lastPWM)), expected LSPV=\(hex(originalPWM))); inspect LED and STOP")
         }
-        print("  Reported SMC state restored. Verify physical LED visually.")
+        print("  Reported SMC state restored after fade. Verify physical LED visually.")
     } catch {
         err("WARNING: restore via LSRB failed: \(error). Inspect the LED immediately.\n")
         throw error
@@ -250,12 +264,18 @@ func run() throws {
     try preflight(smc)
     let cancellation = Cancellation()
     snapshot(smc, heading: "Baseline before experimental on/off control:")
-    // Independent fallback in addition to the restoration after each stage.
+    // Each test stage attempts LSRB restoration. Do not blindly issue a
+    // second LSRB: that can restart a legitimate fade-in. Use an additional
+    // emergency LSRB only when the hardware still reports the LED off.
     defer {
         do {
-            try smc.write("LSRB", bytes: [0])
+            if try smc.read("LSOF") == [1] {
+                err("WARNING: LED still reported off; attempting emergency LSRB restore.\n")
+                try smc.write("LSRB", bytes: [0])
+                Thread.sleep(forTimeInterval: 1.0)
+            }
             snapshot(smc, heading: "Final post-test snapshot:")
-        } catch { err("WARNING: final LSRB restore failed: \(error)\n") }
+        } catch { err("WARNING: final state inspection/emergency restore failed: \(error)\n") }
     }
     let commands: [UInt8] = args[0] == "--suite" ? [0, 1] : [args[0] == "--test-off" ? 0 : 1]
     for value in commands { try test(smc, command: value, cancellation: cancellation) }
