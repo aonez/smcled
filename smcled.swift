@@ -305,6 +305,16 @@ func compatibilitySelfTest() throws {
         }
         print("PASS: \(model) -> \(actual.rawValue)")
     }
+    let original: [UInt8] = [0x2F, 0xFF]
+    let first = intelProposedBytes(original, experiment:
+        IntelLSLNExperiment(byte: .first, value: 0x20, label: "offline first"))
+    let second = intelProposedBytes(original, experiment:
+        IntelLSLNExperiment(byte: .second, value: 0x64, label: "offline second"))
+    guard first == [0x20, 0xFF] && second == [0x2F, 0x64] &&
+          original == [0x2F, 0xFF] else {
+        throw ToolError("Intel LSLN byte-selection self-test failed")
+    }
+    print("PASS: Intel byte-selection logic preserves the other byte")
     print("Compatibility self-tests passed (no SMC access).")
 }
 
@@ -1110,6 +1120,9 @@ func runIntelLSLNStep(_ smc: SMC, original: [UInt8],
     let before = try smc.read("LSLN")
     guard before == original else {
         throw ToolError("Intel LSLN changed unexpectedly to \(hex(before)); aborting")
+    }
+    if experiment.byte == .first && !(0x20...0x40).contains(experiment.value) {
+        throw ToolError("Experimental first-byte values limited to 32...64 for Macmini8,1")
     }
     let requested = intelProposedBytes(original, experiment: experiment)
     guard requested != original else { throw ToolError("Test value is identical to original") }
