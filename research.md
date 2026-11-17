@@ -640,3 +640,14 @@ Not yet tested on-device: sleeping/waking while a transition is missed, unattend
 - On-device sleep test: sleeping resets the front LED to fixed white at maximum (`255`).
 - No resident wake-notification listener is used. The existing one-shot system LaunchDaemon checks again when scheduled after waking; it does not guarantee immediate restoration on wake.
 - The automatic installation now supports `--install-auto [interval_seconds]` (default 300; accepted 30–86400) and stores that interval directly in the LaunchDaemon's `StartInterval` field. `--status` reads the actual configured value from the plist. Reinstall with a different interval to change it.
+
+
+## 17 November 2026 — Read-only compatibility fingerprinting
+
+The CLI now includes `--compatibility` (read-only), `--compatibility-self-test` (pure signature tests), and `--test-brightness <level> --confirm-hardware-test` (two-second, opt-in reversible LSLN test). Candidates are not automatically whitelisted for normal writes, amber switching, or LaunchDaemon installation; the model-specific guard for `Macmini9,1` remains in force.
+
+**Mac Studio M4 Max (`Mac16,9`)**, live read-only result: `LSLN` `ui16` `0xC0`, `LSSB` `hex_` `0x50`, `LSRB` `flag` `0x50`, `LSCS` `ui8 ` `0x90`, `LS0P`/`LS1P` `ui16` `0x80`, all matching the M1 signatures. Normal LED readings: `LSLN=FF FF`, `LSCS=00`, `LS0P=A3 B2`, `LS1P=00 00`. This is an **unverified full-interface candidate**; no physical brightness or amber test has been performed.
+
+**Mac mini 2018 (`Macmini8,1`)**, live read-only key listing: `LS0C` `ui16` `0xC4`, `LSLN` `ui16` `0xC0`, `LSRB` `flag` `0x50`, and `LSSB` `hex_` `0x50`. `LSCS`/`LS0P`/`LS1P` were absent from the returned filtered key scan. This is a **brightness-register candidate**, not established white or amber LED control. The lack of channel telemetry makes the M1 color-restoration procedure unsuitable without further analysis.
+
+`--test-brightness` does not write `LSSB`, `LSRB`, or any channel configuration key. It requires `sudo` plus an explicit flag, verifies `LSLN` metadata, declines unexpected initial values, and restores original brightness on normal exit or handled signals. Readback is not proof of physical LED control; user observation is required. A crash, SIGKILL, or power failure may prevent restoration.
