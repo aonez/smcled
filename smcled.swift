@@ -244,8 +244,9 @@ func reportCompatibility() throws {
         print("Standard LED commands available on the physically tested model.")
     } else if level == .unavailable {
         print("LED writes are blocked: required brightness metadata unavailable.")
-    } else if supportedAppleSiliconDesktops.contains(model) && level == .fullCandidate {
-        print("Untested Apple Silicon desktop: normal commands require --accept-untested-model.")
+    } else if level == .fullCandidate &&
+              (supportedAppleSiliconDesktops.contains(model) || futureAppleSiliconDesktop(model)) {
+        print("Untested Apple Silicon Mac mini/Studio: writes require --accept-untested-model.")
         print("Matching metadata does not prove physical LED behavior.")
     } else {
         print("Only explicit temporary diagnostics are available; normal LED writes are blocked.")
@@ -354,21 +355,82 @@ private let supportedAppleSiliconDesktops: Set<String> = [
 ]
 private let physicallyTestedDesktops: Set<String> = ["Macmini9,1", "Mac16,9"]
 
-func requireSupportedLEDHost() throws {
-    let model = modelID()
-    guard supportedAppleSiliconDesktops.contains(model) else {
-        if model == "Macmini8,1" {
-            throw ToolError("Intel Mac mini has an unverified LSLN=2F FF encoding. Use --test-intel-brightness for a reversible experiment; normal LED commands stay disabled")
-        }
-        throw ToolError("Unverified Mac model \(model). No SMC writes allowed. Check --compatibility and request a reviewed profile for newer models")
+// Future Apple Silicon model IDs have no stable Mac mini/Studio prefix. For
+// unknown IDs, require BOTH an explicit opt-in and system_profiler confirmation
+// of the physical product family. The existing known IDs need no subprocess.
+func looksLikeModernMacIdentifier(_ model: String) -> Bool {
+    model.range(of: #"^Mac[0-9]+,[0-9]+$"#, options: .regularExpression) != nil
+}
+
+func futureAppleSiliconDesktop(_ model: String) -> Bool {
+    #if os(macOS)
+    guard looksLikeModernMacIdentifier(model) else { return false }
+    var supported: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    guard sysctlbyname("hw.optional.arm64", &supported, &size, nil, 0) == 0,
+          supported == 1 else { return false }
+
+    // Avoid shell commands, user-controlled paths and localized text output.
+    // system_profiler's JSON includes machine_model and machine_name.
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+    process.arguments = ["SPHardwareDataType", "-json"]
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    let completed = DispatchGroup()
+    completed.enter()
+    process.terminationHandler = { _ in completed.leave() }
+    do { try process.run() } catch { return false }
+    if completed.wait(timeout: .now() + 10) == .timedOut {
+        if process.isRunning { process.terminate() }
+        return false
     }
-    let smc = try SMC()
+    guard process.terminationStatus == 0,
+          let root = try? JSONSerialization.jsonObject(
+            with: output.fileHandleForReading.readDataToEndOfFile()
+          ) as? [String: Any],
+          let hardware = (root["SPHardwareDataType"] as? [[String: Any]])?.first,
+          hardware["machine_model"] as? String == model,
+          let family = hardware["machine_name"] as? String else { return false }
+    return family == "Mac mini" || family == "Mac Studio"
+    #else
+    return false
+    #endif
+}
+
+func requireSupportedLEDHost(smc existingSMC: SMC? = nil) throws {
+    let model = modelID()
+    if model == "Macmini8,1" {
+        throw ToolError("Intel Mac mini LED encoding is unverified; regular LED writes remain disabled")
+    }
+    let knownModel = supportedAppleSiliconDesktops.contains(model)
+    let acknowledged = CommandLine.arguments.contains("--accept-untested-model")
+    if !knownModel {
+        guard acknowledged else {
+            throw ToolError("Unknown model \(model): requires --accept-untested-model after reviewing experimental hardware risks")
+        }
+        guard futureAppleSiliconDesktop(model) else {
+            throw ToolError("Unknown model \(model): not verified as an Apple Silicon Mac mini or Mac Studio; refusing LED writes")
+        }
+    }
+    // Every model, including a known one, must pass the complete SMC key
+    // profile. Unknown future models additionally need plausible channel and
+    // brightness readings before we write anything.
+    let smc = try existingSMC ?? SMC()
     guard signatureMatches(readCompatibilityKeys(smc), specs: fullSignature) else {
         throw ToolError("SMC LED key metadata differs from the supported profile on \(model); refusing writes")
     }
-    guard physicallyTestedDesktops.contains(model) ||
-          CommandLine.arguments.contains("--accept-untested-model") else {
-        throw ToolError("\(model) is an untested Apple Silicon desktop. LED behavior may differ. Rerun with --accept-untested-model after reviewing the warning")
+    if !knownModel {
+        let brightness = try smc.read("LSLN")
+        let channel = try smc.read("LSCS")
+        guard brightness.count == 2, brightness[0] == brightness[1],
+              channel == [0] || channel == [1] else {
+            throw ToolError("Unknown model \(model): LED state differs from the verified profile; refusing writes")
+        }
+    }
+    guard physicallyTestedDesktops.contains(model) || acknowledged else {
+        throw ToolError("\(model) is an untested Apple Silicon desktop. Rerun with --accept-untested-model after reviewing the warning")
     }
 }
 
@@ -442,7 +504,7 @@ func restoreWhiteChannel(_ smc: SMC) throws {
 // Brightness on flashing amber presets is plausible but not yet hardware verified.
 func applyKnownLED(_ smc: SMC, mode: LEDMode, brightness: UInt8? = nil) throws {
     try requireRoot()
-    try requireSupportedLEDHost()
+    try requireSupportedLEDHost(smc: smc)
     try checkLEDKeys(smc, includeModes: true)
     switch mode {
     case .white:
@@ -603,6 +665,7 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     if automatic { _ = try calculateAutoPlan(at: Date()) }
     // Check access and metadata before touching the installation.
     let smc = try SMC()
+    try requireSupportedLEDHost(smc: smc)
     try checkLEDKeys(smc, includeModes: true)
 
     let fm = FileManager.default
@@ -693,7 +756,6 @@ func preferredBrightnessOrDefault() throws -> UInt8 {
 
 func applyInstalledBrightness() throws {
     try requireRoot()
-    try requireSupportedLEDHost()
     let brightness = try readInstalledBrightness()
     let modeName = try readInstalledModeName()
     // The SMC may not be ready at the first instant launchd loads us.
@@ -703,6 +765,7 @@ func applyInstalledBrightness() throws {
     for attempt in 1...15 {
         do {
             let smc = try SMC()
+            try requireSupportedLEDHost(smc: smc)
             if modeName == "auto" { try applyAutomaticLED(smc) }
             else { try applyKnownLED(smc, mode: LEDMode(rawValue: modeName)!, brightness: brightness) }
             return
@@ -1641,7 +1704,7 @@ func fadeBrightness(_ smc: SMC, from start: UInt8, to end: UInt8,
 
 func applyAutomaticLED(_ smc: SMC) throws {
     try requireRoot()
-    try requireSupportedLEDHost()
+    try requireSupportedLEDHost(smc: smc)
     try checkLEDKeys(smc, includeModes: true)
     let target = try calculateAutoPlan(at: Date()).target
     let current = try readLEDOutput(smc)
@@ -1749,7 +1812,8 @@ func usage() {
                                           Select byte and value without recompiling
       sudo smcled --test-intel-brightness 100 --confirm-hardware-test
                                           Legacy second-byte test on Macmini8,1
-      --accept-untested-model             Acknowledge untested Apple Silicon model
+      --accept-untested-model             Enable a matching but untested Apple Silicon
+                                          mini/Studio (including future models)
       smcled --compatibility-self-test   Offline signature classification tests
       sudo smcled --test-brightness 100 --confirm-hardware-test
                                           Reversible LSLN probe on candidate models
