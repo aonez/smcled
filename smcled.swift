@@ -1,4 +1,4 @@
-// smcled.swift — AppleSMC power LED CLI for the M1 Mac mini
+// smcled.swift — AppleSMC power LED CLI for Apple Silicon Mac mini and Studio
 // No Apple-private headers, third-party dependencies, kext, or SIP changes.
 // Verified on Macmini9,1: white PWM and three amber presets.
 // Confirmed: LSLN controls brightness on steady amber (tested at 10 and 50).
@@ -30,7 +30,7 @@ func fourCCString(_ value: UInt32) -> String {
 }
 
 func putU32(_ number: UInt32, at offset: Int, in buffer: inout [UInt8]) {
-    // The IOKit SMC struct uses host-endian 32-bit fields on Apple Silicon.
+    // The IOKit SMC struct uses little-endian 32-bit fields on supported macOS architectures.
     for i in 0..<4 { buffer[offset + i] = UInt8(truncatingIfNeeded: number >> UInt32(i * 8)) }
 }
 
@@ -168,6 +168,165 @@ final class SMC {
     }
 }
 
+// Non-destructive hardware fingerprinting. Matching SMC metadata is evidence
+// of a compatible interface, NOT proof that the physical LED responds.
+// New models remain guarded until their behavior has been observed on hardware.
+enum CompatibilityLevel: String {
+    case verified = "verified on physical hardware"
+    case fullCandidate = "full LED key-set candidate (unverified)"
+    case brightnessCandidate = "brightness-register candidate (channel support unknown)"
+    case unavailable = "no recognized LED control interface"
+}
+
+private let brightnessSignature: [(String, UInt32, String, Bool, Bool)] = [
+    ("LSLN", 2, "ui16", true, true)
+]
+private let fullSignature: [(String, UInt32, String, Bool, Bool)] = [
+    ("LSLN", 2, "ui16", true, true),
+    ("LSSB", 2, "hex_", false, true),
+    ("LSRB", 1, "flag", false, true),
+    ("LSCS", 1, "ui8 ", true, false),
+    ("LS0P", 2, "ui16", true, false),
+    ("LS1P", 2, "ui16", true, false)
+]
+
+func signatureMatches(_ actual: [String: KeyInfo],
+                      specs: [(String, UInt32, String, Bool, Bool)]) -> Bool {
+    specs.allSatisfy { key, size, type, readable, writable in
+        guard let info = actual[key] else { return false }
+        return info.size == size && info.type == type &&
+               (!readable || info.readable) && (!writable || info.writable)
+    }
+}
+
+func compatibilityLevel(_ model: String, _ keys: [String: KeyInfo]) -> CompatibilityLevel {
+    let full = signatureMatches(keys, specs: fullSignature)
+    if physicallyTestedDesktops.contains(model) && full { return .verified }
+    if full { return .fullCandidate }
+    if signatureMatches(keys, specs: brightnessSignature) { return .brightnessCandidate }
+    return .unavailable
+}
+
+func readCompatibilityKeys(_ smc: SMC) -> [String: KeyInfo] {
+    // Missing/inaccessible keys simply fail to match the signature.
+    let names = ["LSLN", "LSSB", "LSRB", "LSCS", "LS0P", "LS1P"]
+    var result: [String: KeyInfo] = [:]
+    for name in names { result[name] = try? smc.info(name) }
+    return result
+}
+
+func reportCompatibility() throws {
+    let smc = try SMC()
+    let model = modelID()
+    let keys = readCompatibilityKeys(smc)
+    let level = compatibilityLevel(model, keys)
+    print("Mac model: \(model)")
+    print("SMC LED interface: \(level.rawValue)")
+    for (name, size, type, readable, writable) in fullSignature {
+        if let info = keys[name] {
+            let valid = info.size == size && info.type == type &&
+                        (!readable || info.readable) && (!writable || info.writable)
+            let attrs = String(format: "0x%02X", info.attributes)
+            print("  \(name): \(valid ? "matches" : "different")" +
+                  " (size=\(info.size), type=\(info.type.debugDescription), attrs=\(attrs))")
+        } else { print("  \(name): unavailable") }
+    }
+    if let brightness = keys["LSLN"], brightness.readable,
+       brightness.size == 2, let bytes = try? smc.read("LSLN") {
+        print("Current brightness register: \(hex(bytes))")
+        if bytes.count == 2 && bytes[0] != bytes[1] {
+            print("  Note: LSLN bytes differ; their meaning on this Mac is unverified.")
+            print("  The reversible brightness write test will refuse to run.")
+            print("  Use --sample-brightness to inspect changes without writing.")
+        }
+    }
+    if level == .verified {
+        print("Standard LED commands available on the physically tested model.")
+    } else if level == .unavailable {
+        print("LED writes are blocked: required brightness metadata unavailable.")
+    } else if level == .fullCandidate &&
+              (supportedAppleSiliconDesktops.contains(model) || futureAppleSiliconDesktop(model)) {
+        print("Untested Apple Silicon Mac mini/Studio: writes require --accept-untested-model.")
+        print("Matching metadata does not prove physical LED behavior.")
+    } else {
+        print("Only explicit temporary diagnostics are available; normal LED writes are blocked.")
+        print("Matching metadata does not prove physical LED behavior.")
+    }
+}
+
+// Read-only sampling can show whether an unusual brightness register changes
+// over time; it must not be used to infer the meaning of the two bytes.
+func sampleBrightnessRegister() throws {
+    let smc = try SMC()
+    let info = try smc.info("LSLN")
+    guard info.size == 2, info.type == "ui16", info.readable else {
+        throw ToolError("LSLN is not a readable two-byte ui16 key")
+    }
+    print("Read-only LSLN samples on \(modelID()) (no SMC writes):")
+    for i in 0..<10 {
+        let bytes = try smc.read("LSLN")
+        print(String(format: "+%.1fs", Double(i) * 0.5) + "  \(hex(bytes))")
+        if i < 9 { Thread.sleep(forTimeInterval: 0.5) }
+    }
+    print("The samples do not establish how the bytes map to physical brightness.")
+}
+
+// Pure self-tests exercise the classification logic without touching AppleSMC.
+func compatibilitySelfTest() throws {
+    func key(_ size: UInt32, _ type: String, _ attrs: UInt8) -> KeyInfo {
+        KeyInfo(size: size, type: type, attributes: attrs)
+    }
+    let full: [String: KeyInfo] = [
+        "LSLN": key(2, "ui16", 0xC0),
+        "LSSB": key(2, "hex_", 0x50),
+        "LSRB": key(1, "flag", 0x50),
+        "LSCS": key(1, "ui8 ", 0x90),
+        "LS0P": key(2, "ui16", 0x80),
+        "LS1P": key(2, "ui16", 0x80)
+    ]
+    let reduced = full.filter { ["LSLN", "LSSB", "LSRB"].contains($0.key) }
+    var invalid = full
+    invalid["LSLN"] = key(2, "ui16", 0x80) // read-only: no safe brightness test
+    let cases: [(String, [String: KeyInfo], CompatibilityLevel)] = [
+        ("Macmini9,1", full, .verified),
+        ("Mac16,9", full, .verified),
+        ("Mac14,3", full, .fullCandidate),
+        ("Mac16,11", full, .fullCandidate),
+        ("Mac13,2", full, .fullCandidate),
+        ("Mac15,14", full, .fullCandidate),
+        ("Macmini8,1", reduced, .brightnessCandidate),
+        ("Macmini9,1", reduced, .brightnessCandidate),
+        ("Mac16,9", invalid, .unavailable),
+        ("unknown", [:], .unavailable)
+    ]
+    for (model, keys, expected) in cases {
+        let actual = compatibilityLevel(model, keys)
+        guard actual == expected else {
+            throw ToolError("Compatibility self-test failed for \(model): expected \(expected.rawValue), got \(actual.rawValue)")
+        }
+        print("PASS: \(model) -> \(actual.rawValue)")
+    }
+    let original: [UInt8] = [0x2F, 0xFF]
+    let first = intelProposedBytes(original, experiment:
+        IntelLSLNExperiment(byte: .first, value: 0x20, label: "offline first"))
+    let second = intelProposedBytes(original, experiment:
+        IntelLSLNExperiment(byte: .second, value: 0x64, label: "offline second"))
+    guard first == [0x20, 0xFF] && second == [0x2F, 0x64] &&
+          original == [0x2F, 0xFF] else {
+        throw ToolError("Intel LSLN byte-selection self-test failed")
+    }
+    print("PASS: Intel byte-selection logic preserves the other byte")
+    guard looksLikeModernMacIdentifier("Mac17,9"),
+          looksLikeModernMacIdentifier("Mac27,12"),
+          !looksLikeModernMacIdentifier("Macmini8,1"),
+          !looksLikeModernMacIdentifier("MacBookPro19,1"),
+          !looksLikeModernMacIdentifier("Mac17,9-extra") else {
+        throw ToolError("Future-model identifier syntax self-test failed")
+    }
+    print("PASS: future model ID syntax guard")
+    print("Compatibility self-tests passed (no SMC access).")
+}
+
 // A system LaunchDaemon runs this same binary with --apply-installed.
 // The binary and its preference live together in a root-owned directory.
 private let installDirectory = "/Library/Application Support/smcled"
@@ -193,6 +352,93 @@ func requireRoot() throws {
 func requireM1Mini() throws {
     guard modelID() == "Macmini9,1" else {
         throw ToolError("LED changes are only verified on Macmini9,1 (found \(modelID()))")
+    }
+}
+
+// Apple-published model identifiers for Apple Silicon Mac mini and Mac Studio.
+// Only Macmini9,1 and Mac16,9 have physically confirmed LED behavior.
+private let supportedAppleSiliconDesktops: Set<String> = [
+    "Macmini9,1", "Mac14,3", "Mac14,12", "Mac16,10", "Mac16,11",
+    "Mac13,1", "Mac13,2", "Mac14,13", "Mac14,14", "Mac15,14", "Mac16,9"
+]
+private let physicallyTestedDesktops: Set<String> = ["Macmini9,1", "Mac16,9"]
+
+// Future Apple Silicon model IDs have no stable Mac mini/Studio prefix. For
+// unknown IDs, require BOTH an explicit opt-in and system_profiler confirmation
+// of the physical product family. The existing known IDs need no subprocess.
+func looksLikeModernMacIdentifier(_ model: String) -> Bool {
+    model.range(of: #"^Mac[0-9]+,[0-9]+$"#, options: .regularExpression) != nil
+}
+
+func futureAppleSiliconDesktop(_ model: String) -> Bool {
+    #if os(macOS)
+    guard looksLikeModernMacIdentifier(model) else { return false }
+    var supported: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    guard sysctlbyname("hw.optional.arm64", &supported, &size, nil, 0) == 0,
+          supported == 1 else { return false }
+
+    // Avoid shell commands, user-controlled paths and localized text output.
+    // system_profiler's JSON includes machine_model and machine_name.
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+    process.arguments = ["SPHardwareDataType", "-json"]
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    let completed = DispatchGroup()
+    completed.enter()
+    process.terminationHandler = { _ in completed.leave() }
+    do { try process.run() } catch { return false }
+    if completed.wait(timeout: .now() + 10) == .timedOut {
+        if process.isRunning { process.terminate() }
+        return false
+    }
+    guard process.terminationStatus == 0,
+          let root = try? JSONSerialization.jsonObject(
+            with: output.fileHandleForReading.readDataToEndOfFile()
+          ) as? [String: Any],
+          let hardware = (root["SPHardwareDataType"] as? [[String: Any]])?.first,
+          hardware["machine_model"] as? String == model,
+          let family = hardware["machine_name"] as? String else { return false }
+    return family == "Mac mini" || family == "Mac Studio"
+    #else
+    return false
+    #endif
+}
+
+func requireSupportedLEDHost(smc existingSMC: SMC? = nil) throws {
+    let model = modelID()
+    if model == "Macmini8,1" {
+        throw ToolError("Intel Mac mini LED encoding is unverified; regular LED writes remain disabled")
+    }
+    let knownModel = supportedAppleSiliconDesktops.contains(model)
+    let acknowledged = CommandLine.arguments.contains("--accept-untested-model")
+    if !knownModel {
+        guard acknowledged else {
+            throw ToolError("Unknown model \(model): requires --accept-untested-model after reviewing experimental hardware risks")
+        }
+        guard futureAppleSiliconDesktop(model) else {
+            throw ToolError("Unknown model \(model): not verified as an Apple Silicon Mac mini or Mac Studio; refusing LED writes")
+        }
+    }
+    // Every model, including a known one, must pass the complete SMC key
+    // profile. Unknown future models additionally need plausible channel and
+    // brightness readings before we write anything.
+    let smc = try existingSMC ?? SMC()
+    guard signatureMatches(readCompatibilityKeys(smc), specs: fullSignature) else {
+        throw ToolError("SMC LED key metadata differs from the supported profile on \(model); refusing writes")
+    }
+    if !knownModel {
+        let brightness = try smc.read("LSLN")
+        let channel = try smc.read("LSCS")
+        guard brightness.count == 2, brightness[0] == brightness[1],
+              channel == [0] || channel == [1] else {
+            throw ToolError("Unknown model \(model): LED state differs from the verified profile; refusing writes")
+        }
+    }
+    guard physicallyTestedDesktops.contains(model) || acknowledged else {
+        throw ToolError("\(model) is an untested Apple Silicon desktop. Rerun with --accept-untested-model after reviewing the warning")
     }
 }
 
@@ -266,7 +512,7 @@ func restoreWhiteChannel(_ smc: SMC) throws {
 // Brightness on flashing amber presets is plausible but not yet hardware verified.
 func applyKnownLED(_ smc: SMC, mode: LEDMode, brightness: UInt8? = nil) throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost(smc: smc)
     try checkLEDKeys(smc, includeModes: true)
     switch mode {
     case .white:
@@ -285,7 +531,7 @@ func applyKnownLED(_ smc: SMC, mode: LEDMode, brightness: UInt8? = nil) throws {
 // The legacy quick brightness operation is explicitly a white-mode operation.
 func setKnownLEDBrightness(_ brightness: UInt8) throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost()
     let smc = try SMC()
     try applyKnownLED(smc, mode: .white, brightness: brightness)
 }
@@ -401,10 +647,11 @@ func jobIsLoaded() -> Bool {
     (try? callLaunchctl(["print", "system/" + jobLabel], quiet: true)) == 0
 }
 
-func createPlistData(automatic: Bool = false, interval: Int = 300) throws -> Data {
+func createPlistData(automatic: Bool = false, interval: Int = 300, acknowledged: Bool = false) throws -> Data {
+    let args = [installedExecutable, "--apply-installed"] + (acknowledged ? ["--accept-untested-model"] : [])
     var settings: [String: Any] = [
         "Label": jobLabel,
-        "ProgramArguments": [installedExecutable, "--apply-installed"],
+        "ProgramArguments": args,
         "RunAtLoad": true,
         "ProcessType": "Background"
     ]
@@ -421,11 +668,12 @@ func writeManagedFile(_ path: String, data: Data, executable: Bool = false) thro
 
 func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: Bool = false, interval: Int = 300) throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost()
     // Validate solar-time source before modifying a previously working installation.
     if automatic { _ = try calculateAutoPlan(at: Date()) }
     // Check access and metadata before touching the installation.
     let smc = try SMC()
+    try requireSupportedLEDHost(smc: smc)
     try checkLEDKeys(smc, includeModes: true)
 
     let fm = FileManager.default
@@ -458,7 +706,7 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     }
     try writeManagedFile(brightnessPreference, data: Data("\(brightness)\n".utf8))
     try writeManagedFile(modePreference, data: Data("\(automatic ? "auto" : mode.rawValue)\n".utf8))
-    try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval))
+    try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval, acknowledged: !physicallyTestedDesktops.contains(modelID())))
     try installCLILink()
     // A previously disabled service must be re-enabled explicitly.
     _ = try callLaunchctl(["enable", "system/" + jobLabel])
@@ -516,7 +764,6 @@ func preferredBrightnessOrDefault() throws -> UInt8 {
 
 func applyInstalledBrightness() throws {
     try requireRoot()
-    try requireM1Mini()
     let brightness = try readInstalledBrightness()
     let modeName = try readInstalledModeName()
     // The SMC may not be ready at the first instant launchd loads us.
@@ -526,6 +773,7 @@ func applyInstalledBrightness() throws {
     for attempt in 1...15 {
         do {
             let smc = try SMC()
+            try requireSupportedLEDHost(smc: smc)
             if modeName == "auto" { try applyAutomaticLED(smc) }
             else { try applyKnownLED(smc, mode: LEDMode(rawValue: modeName)!, brightness: brightness) }
             return
@@ -600,7 +848,7 @@ func installationStatus() throws {
         }
         else { print("Configured brightness: \(try readInstalledBrightness())") }
     }
-    if modelID() == "Macmini9,1" {
+    if supportedAppleSiliconDesktops.contains(modelID()) {
         let smc = try SMC()
         print("Current LSLN raw: \(hex(try smc.read("LSLN")))")
         print("Current LSCS (channel): \(hex(try smc.read("LSCS")))")
@@ -664,6 +912,83 @@ func testAmberChannel(mode: UInt8) throws {
 // register affects the already active amber channel. Does not claim that it does.
 // Starts in normal white mode, applies fixed amber, samples its PWM, then writes
 // one LSLN value and observes amber PWM. Restores the original state on return.
+// Opt-in candidate test: the Mac Studio's white LED brightness is physically
+// verified, but LSSB/LSRB channel behavior has not yet been confirmed.
+// This test is intentionally restricted to Mac16,9 and never installs a job.
+func testStudioAmberCandidate() throws {
+    try requireRoot()
+    guard modelID() == "Mac16,9" else {
+        throw ToolError("This diagnostic is restricted to the Mac16,9 Mac Studio")
+    }
+    guard !jobIsLoaded() else {
+        throw ToolError("Stop the smcled LaunchDaemon before experimenting with LED modes")
+    }
+    let smc = try SMC()
+    guard signatureMatches(readCompatibilityKeys(smc), specs: fullSignature) else {
+        throw ToolError("Required LED key metadata differs from the tested SMC profile")
+    }
+    let initial = try readLEDOutput(smc)
+    guard initial.selection == [0], initial.amberPWM == [0, 0],
+          initial.whiteActive, initial.brightness.count == 2,
+          initial.brightness[0] == initial.brightness[1] else {
+        throw ToolError("Expected normal white LED with symmetric brightness; no writes attempted")
+    }
+    let cancellation = DiagnosticCancellation()
+    print("Mac16,9 amber candidate test (not previously hardware verified).")
+    print("Initial LSCS=\(hex(initial.selection)) LS0P=\(hex(initial.whitePWM))" +
+          " LS1P=\(hex(initial.amberPWM)) LSLN=\(hex(initial.brightness))")
+    print("Will dim to zero, apply LSSB mode 4, briefly show candidate amber at 100," +
+          " then restore normal white. Observe the physical LED.")
+    // Arm restoration before any writes. If a write fails or a handled signal is
+    // received, attempt the independent restoration steps anyway. SIGKILL,
+    // process crashes, and power failures still cannot be recovered in-process.
+    defer {
+        print("Restoring original white state...")
+        do { try smc.write("LSLN", bytes: [0, 0]) }
+        catch { writeStderr("WARNING: could not blank LED for restoration: \(error)\n") }
+        do { try restoreWhiteChannel(smc) }
+        catch { writeStderr("WARNING: white mode restore failed: \(error)\n") }
+        do { try smc.write("LSLN", bytes: initial.brightness) }
+        catch { writeStderr("WARNING: original brightness restore failed: \(error)\n") }
+        do {
+            let restored = try readLEDOutput(smc)
+            print("Restored LSCS=\(hex(restored.selection)) LS0P=\(hex(restored.whitePWM))" +
+                  " LS1P=\(hex(restored.amberPWM)) LSLN=\(hex(restored.brightness))")
+            if restored.selection != initial.selection ||
+               restored.amberPWM != [0, 0] ||
+               restored.brightness != initial.brightness {
+                writeStderr("WARNING: post-test LED state differs from initial state\n")
+            }
+        } catch { writeStderr("WARNING: restoration readback failed: \(error)\n") }
+    }
+    try cancellation.check()
+    try smc.write("LSLN", bytes: [0, 0])
+    try cancellation.pause(0.35)
+    try smc.write("LSSB", bytes: [4, 0])
+    try cancellation.pause(0.4)
+    let selected = try readLEDOutput(smc)
+    print("Mode 4 LSCS=\(hex(selected.selection)) LS0P=\(hex(selected.whitePWM))" +
+          " LS1P=\(hex(selected.amberPWM)) LSLN=\(hex(selected.brightness))")
+    guard selected.selection == [1], selected.whitePWM == [0, 0] else {
+        print("SMC channel response differs from M1. Stopping before illuminating amber.")
+        return
+    }
+    try cancellation.check()
+    try smc.write("LSLN", bytes: [100, 100])
+    try cancellation.pause(1.5)
+    let amber = try readLEDOutput(smc)
+    print("Candidate amber LSCS=\(hex(amber.selection))" +
+          " LS0P=\(hex(amber.whitePWM)) LS1P=\(hex(amber.amberPWM))" +
+          " LSLN=\(hex(amber.brightness))")
+    if amber.selection == [1] && amber.whitePWM == [0, 0] &&
+       amber.amberActive && amber.brightness == [100, 100] {
+        print("SMC telemetry matches amber mode. Physical color must be confirmed visually.")
+    } else {
+        print("SMC telemetry does not confirm the M1-style amber mode.")
+    }
+    try cancellation.check()
+}
+
 func testAmberBrightness(_ candidate: UInt8) throws {
     try requireRoot()
     try requireM1Mini()
@@ -780,6 +1105,228 @@ final class DiagnosticCancellation: @unchecked Sendable {
             Thread.sleep(forTimeInterval: min(remaining, 0.05))
         } while true
         try check()
+    }
+}
+
+// An opt-in, reversible physical test for machines not yet verified.
+// Does NOT select channels or send behavior presets: only a temporary LSLN
+// change is attempted, then the exact original bytes are restored.
+// The user must visually confirm whether the power LED actually dimmed.
+// Macmini8,1 research-only probe. Its LSLN=2F FF baseline is NOT the
+// symmetric brightness encoding confirmed on Apple Silicon. This diagnostic
+// changes only the second byte, for two seconds, restoring both original bytes.
+// It does not grant ordinary LED operations on this Intel model.
+// Intel 2018 exploratory diagnostics. No SMC key other than LSLN is ever
+// written. The observed baseline 2F FF is a hard prerequisite, NOT a known
+// brightness encoding. First-byte writes are unverified and potentially risky.
+enum IntelLSLNByte: String {
+    case first
+    case second
+}
+
+struct IntelLSLNExperiment {
+    let byte: IntelLSLNByte
+    let value: UInt8
+    let label: String
+}
+
+func intelProposedBytes(_ baseline: [UInt8], experiment: IntelLSLNExperiment) -> [UInt8] {
+    var proposed = baseline
+    switch experiment.byte {
+    case .first: proposed[0] = experiment.value
+    case .second: proposed[1] = experiment.value
+    }
+    return proposed
+}
+
+// Read-only before/after key inventory. Missing keys are normal and are
+// reported explicitly; write-only keys are never read.
+func intelLEDReadout(_ smc: SMC, heading: String) {
+    print(heading)
+    for key in ["LSLN", "LSLB", "LSLF", "LS0C", "LS0P", "LS0S",
+                "LS1C", "LS1P", "LS1S", "LSCS", "LSOF", "LSSE"] {
+        do {
+            let info = try smc.info(key)
+            guard info.readable, info.size > 0, info.size <= 32 else {
+                print("  \(key): present, not readable")
+                continue
+            }
+            let bytes = try smc.read(key)
+            print("  \(key): \(hex(bytes))")
+        } catch {
+            print("  \(key): unavailable")
+        }
+    }
+}
+
+// Return a vetted experimental context. The Intel SMC uses different data
+// than the known Apple Silicon profile; we do not reuse its color controls.
+func intelTestContext() throws -> (SMC, [UInt8]) {
+    try requireRoot()
+    guard modelID() == "Macmini8,1" else {
+        throw ToolError("Intel diagnostics are restricted to the Macmini8,1")
+    }
+    guard !jobIsLoaded() else {
+        throw ToolError("Stop the smcled LaunchDaemon before Intel experiments")
+    }
+    let smc = try SMC()
+    let info = try smc.info("LSLN")
+    guard info.size == 2, info.type == "ui16", info.readable, info.writable else {
+        throw ToolError("Unexpected Intel LSLN metadata; no write attempted")
+    }
+    let original = try smc.read("LSLN")
+    guard original == [0x2F, 0xFF] else {
+        throw ToolError("Expected observed Intel baseline 2F FF; got \(hex(original)). No write attempted")
+    }
+    return (smc, original)
+}
+
+// This function is shared by the individual test and test suite. Restoration
+// is performed before returning; any failed readback aborts the sequence.
+func runIntelLSLNStep(_ smc: SMC, original: [UInt8],
+                      experiment: IntelLSLNExperiment,
+                      cancellation: DiagnosticCancellation) throws {
+    guard original == [0x2F, 0xFF] else { throw ToolError("Unexpected Intel baseline") }
+    try cancellation.check()
+    let before = try smc.read("LSLN")
+    guard before == original else {
+        throw ToolError("Intel LSLN changed unexpectedly to \(hex(before)); aborting")
+    }
+    if experiment.byte == .first && !(0x20...0x40).contains(experiment.value) {
+        throw ToolError("Experimental first-byte values limited to 32...64 for Macmini8,1")
+    }
+    let requested = intelProposedBytes(original, experiment: experiment)
+    guard requested != original else { throw ToolError("Test value is identical to original") }
+    print("TEST \(experiment.label): \(hex(original)) -> \(hex(requested)) for 2 seconds")
+    // Arm restoration before the first write, including if SMC rejects it.
+    // A crash, SIGKILL, or sudden power loss cannot trigger this cleanup.
+    var restorationError: Error?
+    do {
+        try smc.write("LSLN", bytes: requested)
+        let observed = try smc.read("LSLN")
+        print("  SMC readback: \(hex(observed))")
+        try cancellation.pause(2.0)
+    } catch {
+        restorationError = error
+    }
+    // Always restore, independently of the preceding test result.
+    do {
+        try smc.write("LSLN", bytes: original)
+        let restored = try smc.read("LSLN")
+        print("  Restored LSLN: \(hex(restored))")
+        guard restored == original else {
+            throw ToolError("Intel LSLN restore mismatch; expected \(hex(original)), got \(hex(restored)). STOP")
+        }
+    } catch {
+        writeStderr("WARNING: Intel LSLN restoration failed: \(error)\n")
+        throw error
+    }
+    if let restorationError { throw restorationError }
+    print("  Visual result: compare LED brightness manually; no automatic confirmation.")
+}
+
+func runIntelLSLNExperiments(_ experiments: [IntelLSLNExperiment]) throws {
+    let (smc, original) = try intelTestContext()
+    let cancellation = DiagnosticCancellation()
+    print("EXPERIMENTAL Macmini8,1 LSLN tests. Original register \(hex(original)).")
+    print("The byte meanings are UNKNOWN. First-byte changes are UNTESTED.")
+    print("Only LSLN is written, never LSSB, LSRB, or channel configuration keys.")
+    print("If an interrupted test leaves the LED changed, stop and investigate.")
+    intelLEDReadout(smc, heading: "Before tests (read only):")
+    // Final fallback even if a stage fails. This must not replace the
+    // per-stage restoration/verification above.
+    defer {
+        do {
+            let current = try smc.read("LSLN")
+            if current != original {
+                try smc.write("LSLN", bytes: original)
+                print("Final fallback restore: \(hex(try smc.read("LSLN")))")
+            }
+        } catch {
+            writeStderr("WARNING: Final Intel LSLN restoration failed: \(error)\n")
+        }
+    }
+    for (index, experiment) in experiments.enumerated() {
+        print("Step \(index + 1)/\(experiments.count)")
+        try runIntelLSLNStep(smc, original: original,
+                             experiment: experiment, cancellation: cancellation)
+        intelLEDReadout(smc, heading: "After step \(index + 1) (read only):")
+        if index + 1 < experiments.count { try cancellation.pause(0.75) }
+    }
+    print("Intel diagnostics complete; no persistent setting was installed.")
+}
+
+func intelReadOnlyDiagnostics() throws {
+    guard modelID() == "Macmini8,1" else {
+        throw ToolError("Intel diagnostics are restricted to Macmini8,1")
+    }
+    let smc = try SMC()
+    intelLEDReadout(smc, heading: "Macmini8,1 LED-related SMC snapshot (read only):")
+}
+
+func intelSuite() throws {
+    // Conservative first-byte variations around the observed value 0x2F.
+    // The second-byte variation is included as a reproducibility control.
+    try runIntelLSLNExperiments([
+        IntelLSLNExperiment(byte: .first, value: 0x20, label: "first byte 2F -> 20"),
+        IntelLSLNExperiment(byte: .first, value: 0x40, label: "first byte 2F -> 40"),
+        IntelLSLNExperiment(byte: .second, value: 0x64, label: "second byte FF -> 64 (prior no visible effect)")
+    ])
+}
+
+// Legacy command retained, using the same step engine as all new tests.
+func testIntelBrightnessCandidate(_ candidate: UInt8) throws {
+    try runIntelLSLNExperiments([
+        IntelLSLNExperiment(byte: .second, value: candidate, label: "second byte")
+    ])
+}
+
+func testBrightnessCandidate(_ candidate: UInt8) throws {
+    try requireRoot()
+    let smc = try SMC()
+    let keys = readCompatibilityKeys(smc)
+    let level = compatibilityLevel(modelID(), keys)
+    guard level != .unavailable else {
+        throw ToolError("LSLN metadata is not compatible; refusing hardware test")
+    }
+    guard !jobIsLoaded() else {
+        throw ToolError("Stop the smcled LaunchDaemon before a temporary hardware probe")
+    }
+    let original = try smc.read("LSLN")
+    guard original.count == 2, original[0] == original[1] else {
+        throw ToolError("LSLN bytes are asymmetric (\(hex(original))); refusing writes. Use --sample-brightness for a read-only investigation")
+    }
+    let requested = [candidate, candidate]
+    guard original != requested else {
+        throw ToolError("Test brightness equals current value; choose a different level")
+    }
+    // Do not test in a non-white preset if channel telemetry is present.
+    if level == .verified || level == .fullCandidate {
+        guard try smc.read("LSCS") == [0], try smc.read("LS1P") == [0, 0] else {
+            throw ToolError("Start from normal white mode for a reversible test")
+        }
+    }
+    let cancellation = DiagnosticCancellation()
+    print("Temporary LSLN test on \(modelID()), brightness \(original[0]) -> \(candidate).")
+    print("Observe the physical LED. Metadata/readback alone cannot verify support.")
+    // Always arm cleanup before the first write. Signals can interrupt the pause;
+    // sudden power loss or SIGKILL cannot be recovered automatically.
+    defer {
+        do {
+            try smc.write("LSLN", bytes: original)
+            let restored = try smc.read("LSLN")
+            print("Restored LSLN=\(hex(restored))" + (restored == original ? "" : " [WARNING: mismatch]"))
+        } catch { writeStderr("WARNING: failed to restore LSLN: \(error)\n") }
+    }
+    try cancellation.check()
+    try smc.write("LSLN", bytes: requested)
+    let observed = try smc.read("LSLN")
+    print("Test LSLN readback: \(hex(observed))")
+    try cancellation.pause(2.0)
+    if observed != requested {
+        print("SMC did not echo the requested brightness; hardware support is unconfirmed.")
+    } else {
+        print("SMC accepted the change; physical LED behavior still needs visual confirmation.")
     }
 }
 
@@ -1165,7 +1712,7 @@ func fadeBrightness(_ smc: SMC, from start: UInt8, to end: UInt8,
 
 func applyAutomaticLED(_ smc: SMC) throws {
     try requireRoot()
-    try requireM1Mini()
+    try requireSupportedLEDHost(smc: smc)
     try checkLEDKeys(smc, includeModes: true)
     let target = try calculateAutoPlan(at: Date()).target
     let current = try readLEDOutput(smc)
@@ -1234,7 +1781,7 @@ func testZeroBrightness() throws {
 
 func usage() {
     print("""
-    smcled — AppleSMC status LED CLI for M1 Mac mini (Macmini9,1)
+    smcled — AppleSMC status LED CLI for Mac mini and Mac Studio
 
       sudo smcled 10                      White at brightness 10
       sudo smcled --white [0...255]      White; optional brightness (current if omitted)
@@ -1263,6 +1810,23 @@ func usage() {
       smcled --status                    Read configured settings; no sudo
       sudo smcled --uninstall            Remove daemon, files, symlink; reset LED
 
+      smcled --compatibility             Read-only hardware capability report
+      smcled --sample-brightness         Read LSLN repeatedly, without writes
+      smcled --intel-snapshot              Read-only Intel SMC LED key inventory
+      sudo smcled --intel-suite --confirm-hardware-test
+                                          Three reversible Intel LSLN tests
+      sudo smcled --intel-probe first 32 --confirm-hardware-test
+      sudo smcled --intel-probe second 100 --confirm-hardware-test
+                                          Select byte and value without recompiling
+      sudo smcled --test-intel-brightness 100 --confirm-hardware-test
+                                          Legacy second-byte test on Macmini8,1
+      --accept-untested-model             Enable a matching but untested Apple Silicon
+                                          mini/Studio (including future models)
+      smcled --compatibility-self-test   Offline signature classification tests
+      sudo smcled --test-brightness 100 --confirm-hardware-test
+                                          Reversible LSLN probe on candidate models
+      sudo smcled --test-studio-amber --confirm-hardware-test
+                                          Reversible steady amber probe on Mac16,9
       smcled model                       Print hardware identifier
       smcled read <FOURCC>               Read an SMC key
       smcled info <FOURCC>               Read key metadata
@@ -1313,11 +1877,63 @@ func ledBytes(_ value: UInt8, mode: String) -> [UInt8] {
     mode == "vv" ? [value, value] : [value, 0]
 }
 
-func run(_ arguments: [String]) throws {
+func run(_ originalArguments: [String]) throws {
+    let arguments = originalArguments.filter { $0 != "--accept-untested-model" }
     guard let command = arguments.first else { usage(); return }
     if ["--help", "help", "-h"].contains(command) { usage(); return }
     if command == "model" { print(modelID()); return }
     switch command {
+    case "--compatibility":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility") }
+        try reportCompatibility()
+        return
+    case "--intel-snapshot":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-snapshot") }
+        try intelReadOnlyDiagnostics()
+        return
+    case "--intel-suite":
+        guard arguments.count == 2, arguments[1] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --intel-suite --confirm-hardware-test")
+        }
+        try intelSuite()
+        return
+    case "--intel-probe":
+        guard arguments.count == 4,
+              let byte = IntelLSLNByte(rawValue: arguments[1]),
+              arguments[3] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --intel-probe <first|second> <0...255> --confirm-hardware-test")
+        }
+        try runIntelLSLNExperiments([
+            IntelLSLNExperiment(byte: byte, value: try brightnessNumber(arguments[2]),
+                                 label: "\(byte.rawValue) byte")
+        ])
+        return
+    case "--test-intel-brightness":
+        guard arguments.count == 3, arguments[2] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --test-intel-brightness <0...255> --confirm-hardware-test")
+        }
+        try testIntelBrightnessCandidate(brightnessNumber(arguments[1]))
+        return
+    case "--sample-brightness":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --sample-brightness") }
+        try sampleBrightnessRegister()
+        return
+    case "--compatibility-self-test":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility-self-test") }
+        try compatibilitySelfTest()
+        return
+    case "--test-studio-amber":
+        guard arguments.count == 2, arguments[1] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --test-studio-amber --confirm-hardware-test")
+        }
+        try testStudioAmberCandidate()
+        return
+    case "--test-brightness":
+        guard arguments.count == 3, arguments[2] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --test-brightness <0...255> --confirm-hardware-test")
+        }
+        try testBrightnessCandidate(brightnessNumber(arguments[1]))
+        return
     case "--auto-preview":
         guard arguments.count == 1 || arguments.count == 4 else {
             throw ToolError("Usage: smcled --auto-preview [<latitude> <longitude> <IANA-timezone>]")
@@ -1336,7 +1952,7 @@ func run(_ arguments: [String]) throws {
     case "--auto-check":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --auto-check") }
         try requireRoot()
-        try requireM1Mini()
+        try requireSupportedLEDHost()
         try applyAutomaticLED(SMC())
         return
     case "--install-auto":

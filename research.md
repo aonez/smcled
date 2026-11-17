@@ -640,3 +640,66 @@ Not yet tested on-device: sleeping/waking while a transition is missed, unattend
 - On-device sleep test: sleeping resets the front LED to fixed white at maximum (`255`).
 - No resident wake-notification listener is used. The existing one-shot system LaunchDaemon checks again when scheduled after waking; it does not guarantee immediate restoration on wake.
 - The automatic installation now supports `--install-auto [interval_seconds]` (default 300; accepted 30–86400) and stores that interval directly in the LaunchDaemon's `StartInterval` field. `--status` reads the actual configured value from the plist. Reinstall with a different interval to change it.
+
+
+## 17 November 2026 — Read-only compatibility fingerprinting
+
+The CLI now includes `--compatibility` (read-only), `--compatibility-self-test` (pure signature tests), and `--test-brightness <level> --confirm-hardware-test` (two-second, opt-in reversible LSLN test). Candidates are not automatically whitelisted for normal writes, amber switching, or LaunchDaemon installation; the model-specific guard for `Macmini9,1` remains in force.
+
+**Mac Studio M4 Max (`Mac16,9`)**, live read-only result: `LSLN` `ui16` `0xC0`, `LSSB` `hex_` `0x50`, `LSRB` `flag` `0x50`, `LSCS` `ui8 ` `0x90`, `LS0P`/`LS1P` `ui16` `0x80`, all matching the M1 signatures. Normal LED readings: `LSLN=FF FF`, `LSCS=00`, `LS0P=A3 B2`, `LS1P=00 00`. This is an **unverified full-interface candidate**; no physical brightness or amber test has been performed.
+
+**Mac mini 2018 (`Macmini8,1`)**, live read-only key listing: `LS0C` `ui16` `0xC4`, `LSLN` `ui16` `0xC0`, `LSRB` `flag` `0x50`, and `LSSB` `hex_` `0x50`. `LSCS`/`LS0P`/`LS1P` were absent from the returned filtered key scan. This is a **brightness-register candidate**, not established white or amber LED control. The lack of channel telemetry makes the M1 color-restoration procedure unsuitable without further analysis.
+
+`--test-brightness` does not write `LSSB`, `LSRB`, or any channel configuration key. It requires `sudo` plus an explicit flag, verifies `LSLN` metadata, declines unexpected initial values, and restores original brightness on normal exit or handled signals. Readback is not proof of physical LED control; user observation is required. A crash, SIGKILL, or power failure may prevent restoration.
+
+## 17 November 2026 — Physical brightness test results
+
+- **Mac Studio M4 Max (`Mac16,9`):** `--compatibility` matched all six keys in the full interface. `sudo ./smcled --test-brightness 100 --confirm-hardware-test` changed `LSLN=FF FF` to `64 64` and restored `FF FF`. The user physically observed the white status LED dim and return to full brightness. **White brightness adjustment is now hardware-verified on Mac16,9.** Amber, flashing presets, and persistent installation remain untested and blocked by the existing guard.
+- **Mac mini 2018 (`Macmini8,1`):** `--compatibility` showed `LSLN=2F FF`, unlike symmetric values on Apple Silicon machines. The same temporary test correctly refused before writing: `Unexpected LSLN=2F FF`. **No LED writes were made.** The mapping of the two bytes is unknown; do not replace `2F FF` with `64 64` simply to force a test.
+- The read-only `--sample-brightness` command gathers repeated values for investigating whether the unusual Intel SMC value changes over time. It makes no SMC writes and cannot establish the two-byte encoding by itself.
+
+
+### Pending Mac Studio amber probe
+
+A guarded `--test-studio-amber --confirm-hardware-test` command was added for `Mac16,9` only. It requires root, no loaded smcled job, full SMC signature, initial white channel (`LSCS=00`, `LS1P=0000`) and symmetric brightness. After dimming white to zero, it sends only the M1-tested steady amber preset (`LSSB=04 00`) and checks channel telemetry. If the channel responds as expected, it displays brightness 100 for 1.5 seconds. A `defer` attempts to return to white using `LSRB` and the saved `LSLN`. SIGINT/SIGTERM use the existing cancellation handler; process crash, SIGKILL, or a power interruption can defeat restoration. **Mac Studio amber and restore behavior are still unverified until observed physically.** No regular write permissions were expanded.
+## 17 November 2026 — Mac Studio amber and guarded family support
+
+**Mac Studio M4 Max (`Mac16,9`) passed the physical amber test.** Initially `LSCS=00 LS0P=A3 B2 LS1P=00 00 LSLN=FF FF`. The `LSSB=04 00` preset selected channel 1 and visually produced amber. At `LSLN=64 64`, `LS1P=41 A9`. After restoration, `LSCS=00` and `LSLN=FF FF`; `LS0P=00 00` at the immediate sample may indicate delayed PWM settling. The user reports correct restoration.
+
+Apple Silicon Mac mini and Studio identifiers covering M1–M4 are recognized in the normal command paths, with full SMC metadata validation. Only `Macmini9,1` and `Mac16,9` have confirmed physical behavior. Other listed models must pass `--accept-untested-model`; their installed daemon records this acknowledgement. Unknown newer model IDs stay blocked pending review. Flashing presets on Mac Studio remain unverified.
+
+**Mac mini 2018 (`Macmini8,1`)** returned stable asymmetric `LSLN=2F FF` in ten samples. Encoding remains unknown. An explicitly experimental `--test-intel-brightness` command alters only byte 2 for two seconds and restores both original bytes. It does not enable permanent Intel control, and a failed process or power loss could prevent restoration.
+
+## 17 November 2026 — Manual Mac Studio confirmation; Intel test result
+
+- **Mac Studio M4 Max (`Mac16,9`):** The user ran the normal, newly enabled commands `sudo ./smcled --amber 100` and `sudo ./smcled --white 255`. Both worked visually as expected. Together with the earlier white brightness and reversible amber diagnostic tests, this **physically verifies manual white and steady amber switching on `Mac16,9`**. The user expressly chose **not** to install the LaunchDaemon on the Studio, so persistent auto mode on this machine is **not yet tested**. Flashing patterns on Studio have also **not** been tested.
+- **Mac mini 2018 (`Macmini8,1`):** `sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test` changed the observed `LSLN` bytes from `2F FF` to `2F 64` for two seconds, then restored `2F FF`. The user saw **no visible LED brightness change**. This does not establish that the first byte controls brightness or that the machine cannot be dimmed; the encoding and effects of undocumented keys remain unknown. Keep normal Intel LED writes and installation disabled.
+
+## 17 November 2026 — Intel multi-test diagnostics in one build
+
+New Macmini8,1-only diagnostic commands:
+
+- `--intel-snapshot`: read-only inventory of LED-related SMC keys, reporting unavailable keys without writes.
+- `--intel-suite --confirm-hardware-test`: three sequential, reversible two-second `LSLN` experiments: `2F FF → 20 FF` (first byte), `2F FF → 40 FF` (first byte), then `2F FF → 2F 64` (second byte, previous no-visible-effect control).
+- `--intel-probe first|second <0...255> --confirm-hardware-test`: selectable reversible test without rebuilding. First-byte values limited to decimal 32–64 because the first byte has not previously been modified on this model.
+- The prior `--test-intel-brightness` remains available, using the common probe engine.
+
+Every stage verifies the observed baseline `2F FF`, samples the test value, and attempts to restore and re-read the exact baseline before continuing. A failed restore stops subsequent probes; there is an additional best-effort restore on exit. `SIGINT`/`SIGTERM` are handled through the existing diagnostic cancellation object, but crash, SIGKILL, and power loss cannot guarantee restoration. Only `LSLN` is ever written. No Intel support is granted for ordinary or persistent LED changes. **No first-byte hardware experiment has yet been run.**
+
+## 17 November 2026 — Intel three-stage physical observation
+
+On `Macmini8,1`, user ran `--intel-snapshot` and `--intel-suite --confirm-hardware-test` successfully. `LSLN` was initially `2F FF`; other read-only keys included `LSLB=FF FF`, `LSLF=00 00`, `LS0C=FF FF`, `LSOF=00`, and `LSSE=01`. `LS0P`, `LS0S`, `LS1C`, `LS1P`, `LS1S`, `LSCS` were unavailable. Three steps accepted their respective values and restored the original `LSLN` after each:
+
+- `2F FF` -> `20 FF` -> `2F FF`: **no visible brightness change**.
+- `2F FF` -> `40 FF` -> `2F FF`: **no visible brightness change**.
+- `2F FF` -> `2F 64` -> `2F FF`: **no visible brightness change** (reproducing prior outcome).
+
+All reported read-only key snapshots after each stage matched the initial baseline. User explicitly reported no visual change in any stage. This does **not** establish that these keys are irrelevant in all conditions, but there is no evidence here that `LSLN` drives the physical LED on the Intel mini. Stop blind SMC write experiments; seek device/firmware-specific evidence before any new Intel write tests. Intel normal LED commands and installation stay disabled.
+
+## 17 November 2026 — Startup retries and opt-in for future Apple Silicon desktops
+
+`applyInstalledBrightness()` now enters the bounded boot-time retry loop **before** opening/checking AppleSMC. This fixes the case where an early AppleSMC failure previously bypassed all 15 retries. The loop passes the opened SMC connection to the model/key guard before applying saved mode.
+
+`--accept-untested-model` remains required for all recognized but unverified M1–M4 mini/Studio models. It now also allows **unlisted future Apple Silicon Mac mini or Mac Studio models** only if: `hw.model` matches the modern `MacN,N` syntax, `hw.optional.arm64` confirms Apple Silicon, `/usr/sbin/system_profiler SPHardwareDataType -json` reports the same model ID and a `Mac mini` or `Mac Studio` product family, the SMC full key signature matches the verified profile, and the current brightness/channel readback looks plausible. The flag is persisted into the LaunchDaemon command on unverified models. Intel models and other product families remain blocked. The tool makes no assertion that future hardware is physically verified.
+
+The new unknown-model product-family check invokes the OS system profiler with a bounded 10-second timeout. If it is unavailable or cannot identify the family, no write is allowed. The diagnostic `--compatibility-self-test` now covers future model-ID syntax.
