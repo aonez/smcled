@@ -63,7 +63,11 @@ Fixed startup settings are also available, e.g. `sudo ./smcled --install amber 1
 ./smcled --sample-brightness         # Read-only LSLN samples
 sudo ./smcled --test-brightness 100 --confirm-hardware-test
 sudo ./smcled --test-studio-amber --confirm-hardware-test  # Mac16,9 only
-sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Macmini8,1
+./smcled --intel-snapshot            # Intel: read-only LED-related SMC keys
+sudo ./smcled --intel-suite --confirm-hardware-test  # Intel: three stages
+sudo ./smcled --intel-probe first 32 --confirm-hardware-test
+sudo ./smcled --intel-probe second 100 --confirm-hardware-test
+sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Legacy second-byte probe
 ```
 
 `--compatibility` reports SMC metadata, not proof of physical LED behavior. M1–M4 Apple Silicon Mac mini/Studio models are recognized by identifier and require the complete LED key signature. **Untested models require** `--accept-untested-model` on write or installation commands. Unknown newer models stay blocked pending an updated profile.
@@ -71,6 +75,10 @@ sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Macmini8,1
 Steady amber and white brightness have been physically verified on the M1 mini and M4 Max Studio. Flashing modes have only been tested on the M1 mini.
 
 **Intel Mac mini 2018 (`Macmini8,1`) remains experimental:** its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. In a physical test, changing only the second byte to `64` produced **no visible LED change**; the original `2F FF` was restored. The register's meaning remains unknown, so normal commands and installation remain disabled on Intel.
+
+**Intel multi-test workflow:** `--intel-suite` runs three 2-second probes on the first and second bytes in order: `2F FF → 20 FF`, `2F FF → 40 FF`, and `2F FF → 2F 64`. It restores and verifies `2F FF` after **each** test and aborts if restoration fails. `--intel-probe first|second <decimal-value>` lets you select additional probes without rebuilding; first-byte values are limited to **32–64**. `--intel-snapshot` reads related SMC keys without writing. Watch the LED during each stage; SMC readback alone does not prove any visual change.
+
+**Warning:** The first byte has never been modified on this Intel model, and its meaning is unknown. These are experimental writes to an undocumented controller, not proven-safe brightness commands. Run only with physical access; a crash or power failure can prevent restoration.
 
 For a recognized but untested M2/M3/M4 mini or Studio:
 
