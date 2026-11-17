@@ -30,7 +30,7 @@ func fourCCString(_ value: UInt32) -> String {
 }
 
 func putU32(_ number: UInt32, at offset: Int, in buffer: inout [UInt8]) {
-    // The IOKit SMC struct uses host-endian 32-bit fields on Apple Silicon.
+    // The IOKit SMC struct uses little-endian 32-bit fields on supported macOS architectures.
     for i in 0..<4 { buffer[offset + i] = UInt8(truncatingIfNeeded: number >> UInt32(i * 8)) }
 }
 
@@ -166,6 +166,118 @@ final class SMC {
         for (index, byte) in bytes.enumerated() { input[48 + index] = byte }
         _ = try call(input)
     }
+}
+
+// Non-destructive hardware fingerprinting. Matching SMC metadata is evidence
+// of a compatible interface, NOT proof that the physical LED responds.
+// New models remain guarded until their behavior has been observed on hardware.
+enum CompatibilityLevel: String {
+    case verified = "verified on physical hardware"
+    case fullCandidate = "full LED key-set candidate (unverified)"
+    case brightnessCandidate = "brightness-register candidate (channel support unknown)"
+    case unavailable = "no recognized LED control interface"
+}
+
+private let brightnessSignature: [(String, UInt32, String, Bool, Bool)] = [
+    ("LSLN", 2, "ui16", true, true)
+]
+private let fullSignature: [(String, UInt32, String, Bool, Bool)] = [
+    ("LSLN", 2, "ui16", true, true),
+    ("LSSB", 2, "hex_", false, true),
+    ("LSRB", 1, "flag", false, true),
+    ("LSCS", 1, "ui8 ", true, false),
+    ("LS0P", 2, "ui16", true, false),
+    ("LS1P", 2, "ui16", true, false)
+]
+
+func signatureMatches(_ actual: [String: KeyInfo],
+                      specs: [(String, UInt32, String, Bool, Bool)]) -> Bool {
+    specs.allSatisfy { key, size, type, readable, writable in
+        guard let info = actual[key] else { return false }
+        return info.size == size && info.type == type &&
+               (!readable || info.readable) && (!writable || info.writable)
+    }
+}
+
+func compatibilityLevel(_ model: String, _ keys: [String: KeyInfo]) -> CompatibilityLevel {
+    let full = signatureMatches(keys, specs: fullSignature)
+    if model == "Macmini9,1" && full { return .verified }
+    if full { return .fullCandidate }
+    if signatureMatches(keys, specs: brightnessSignature) { return .brightnessCandidate }
+    return .unavailable
+}
+
+func readCompatibilityKeys(_ smc: SMC) -> [String: KeyInfo] {
+    // Missing/inaccessible keys simply fail to match the signature.
+    let names = ["LSLN", "LSSB", "LSRB", "LSCS", "LS0P", "LS1P"]
+    var result: [String: KeyInfo] = [:]
+    for name in names { result[name] = try? smc.info(name) }
+    return result
+}
+
+func reportCompatibility() throws {
+    let smc = try SMC()
+    let model = modelID()
+    let keys = readCompatibilityKeys(smc)
+    let level = compatibilityLevel(model, keys)
+    print("Mac model: \(model)")
+    print("SMC LED interface: \(level.rawValue)")
+    for (name, size, type, readable, writable) in fullSignature {
+        if let info = keys[name] {
+            let valid = info.size == size && info.type == type &&
+                        (!readable || info.readable) && (!writable || info.writable)
+            let attrs = String(format: "0x%02X", info.attributes)
+            print("  \(name): \(valid ? "matches" : "different")" +
+                  " (size=\(info.size), type=\(info.type.debugDescription), attrs=\(attrs))")
+        } else { print("  \(name): unavailable") }
+    }
+    if let brightness = keys["LSLN"], brightness.readable,
+       brightness.size == 2, let bytes = try? smc.read("LSLN") {
+        print("Current brightness register: \(hex(bytes))")
+    }
+    if level == .verified {
+        print("Standard LED commands are enabled for Macmini9,1.")
+    } else if level == .unavailable {
+        print("LED writes are blocked: required brightness metadata unavailable.")
+    } else {
+        print("Only the explicitly confirmed temporary brightness test is available.")
+        print("SMC metadata cannot prove physical LED response or amber support.")
+        print("Normal LED writes and installation remain restricted to Macmini9,1.")
+    }
+}
+
+// Pure self-tests exercise the classification logic without touching AppleSMC.
+func compatibilitySelfTest() throws {
+    func key(_ size: UInt32, _ type: String, _ attrs: UInt8) -> KeyInfo {
+        KeyInfo(size: size, type: type, attributes: attrs)
+    }
+    let full: [String: KeyInfo] = [
+        "LSLN": key(2, "ui16", 0xC0),
+        "LSSB": key(2, "hex_", 0x50),
+        "LSRB": key(1, "flag", 0x50),
+        "LSCS": key(1, "ui8 ", 0x90),
+        "LS0P": key(2, "ui16", 0x80),
+        "LS1P": key(2, "ui16", 0x80)
+    ]
+    let reduced = full.filter { ["LSLN", "LSSB", "LSRB"].contains($0.key) }
+    var invalid = full
+    invalid["LSLN"] = key(2, "ui16", 0x80) // read-only: no safe brightness test
+    let cases: [(String, [String: KeyInfo], CompatibilityLevel)] = [
+        ("Macmini9,1", full, .verified),
+        ("Mac16,9", full, .fullCandidate),
+        ("Macmini8,1", reduced, .brightnessCandidate),
+        ("Macmini9,1", reduced, .brightnessCandidate),
+        ("Mac16,9", invalid, .unavailable),
+        ("unknown", [:], .unavailable)
+    ]
+    for (model, keys, expected) in cases {
+        let actual = compatibilityLevel(model, keys)
+        guard actual == expected else {
+            throw ToolError("Compatibility self-test failed for \(model): expected \(expected.rawValue), got \(actual.rawValue)")
+        }
+        print("PASS: \(model) -> \(actual.rawValue)")
+    }
+    print("Compatibility self-tests passed (no SMC access).")
 }
 
 // A system LaunchDaemon runs this same binary with --apply-installed.
@@ -783,6 +895,59 @@ final class DiagnosticCancellation: @unchecked Sendable {
     }
 }
 
+// An opt-in, reversible physical test for machines not yet verified.
+// Does NOT select channels or send behavior presets: only a temporary LSLN
+// change is attempted, then the exact original bytes are restored.
+// The user must visually confirm whether the power LED actually dimmed.
+func testBrightnessCandidate(_ candidate: UInt8) throws {
+    try requireRoot()
+    let smc = try SMC()
+    let keys = readCompatibilityKeys(smc)
+    let level = compatibilityLevel(modelID(), keys)
+    guard level != .unavailable else {
+        throw ToolError("LSLN metadata is not compatible; refusing hardware test")
+    }
+    guard !jobIsLoaded() else {
+        throw ToolError("Stop the smcled LaunchDaemon before a temporary hardware probe")
+    }
+    let original = try smc.read("LSLN")
+    guard original.count == 2, original[0] == original[1] else {
+        throw ToolError("Unexpected LSLN=\(hex(original)); refusing test")
+    }
+    let requested = [candidate, candidate]
+    guard original != requested else {
+        throw ToolError("Test brightness equals current value; choose a different level")
+    }
+    // Do not test in a non-white preset if channel telemetry is present.
+    if level == .verified || level == .fullCandidate {
+        guard try smc.read("LSCS") == [0], try smc.read("LS1P") == [0, 0] else {
+            throw ToolError("Start from normal white mode for a reversible test")
+        }
+    }
+    let cancellation = DiagnosticCancellation()
+    print("Temporary LSLN test on \(modelID()), brightness \(original[0]) -> \(candidate).")
+    print("Observe the physical LED. Metadata/readback alone cannot verify support.")
+    // Always arm cleanup before the first write. Signals can interrupt the pause;
+    // sudden power loss or SIGKILL cannot be recovered automatically.
+    defer {
+        do {
+            try smc.write("LSLN", bytes: original)
+            let restored = try smc.read("LSLN")
+            print("Restored LSLN=\(hex(restored))" + (restored == original ? "" : " [WARNING: mismatch]"))
+        } catch { writeStderr("WARNING: failed to restore LSLN: \(error)\n") }
+    }
+    try cancellation.check()
+    try smc.write("LSLN", bytes: requested)
+    let observed = try smc.read("LSLN")
+    print("Test LSLN readback: \(hex(observed))")
+    try cancellation.pause(2.0)
+    if observed != requested {
+        print("SMC did not echo the requested brightness; hardware support is unconfirmed.")
+    } else {
+        print("SMC accepted the change; physical LED behavior still needs visual confirmation.")
+    }
+}
+
 func collectLEDOutput(_ smc: SMC,
                       stage: String,
                       samples count: Int,
@@ -1263,6 +1428,10 @@ func usage() {
       smcled --status                    Read configured settings; no sudo
       sudo smcled --uninstall            Remove daemon, files, symlink; reset LED
 
+      smcled --compatibility             Read-only hardware capability report
+      smcled --compatibility-self-test   Offline signature classification tests
+      sudo smcled --test-brightness 100 --confirm-hardware-test
+                                          Reversible LSLN probe on candidate models
       smcled model                       Print hardware identifier
       smcled read <FOURCC>               Read an SMC key
       smcled info <FOURCC>               Read key metadata
@@ -1318,6 +1487,20 @@ func run(_ arguments: [String]) throws {
     if ["--help", "help", "-h"].contains(command) { usage(); return }
     if command == "model" { print(modelID()); return }
     switch command {
+    case "--compatibility":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility") }
+        try reportCompatibility()
+        return
+    case "--compatibility-self-test":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility-self-test") }
+        try compatibilitySelfTest()
+        return
+    case "--test-brightness":
+        guard arguments.count == 3, arguments[2] == "--confirm-hardware-test" else {
+            throw ToolError("Usage: sudo smcled --test-brightness <0...255> --confirm-hardware-test")
+        }
+        try testBrightnessCandidate(brightnessNumber(arguments[1]))
+        return
     case "--auto-preview":
         guard arguments.count == 1 || arguments.count == 4 else {
             throw ToolError("Usage: smcled --auto-preview [<latitude> <longitude> <IANA-timezone>]")
