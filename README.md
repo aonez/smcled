@@ -74,7 +74,7 @@ sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Legacy seco
 
 Steady amber and white brightness have been physically verified on the M1 mini and M4 Max Studio. Flashing modes have only been tested on the M1 mini.
 
-**Intel Mac mini 2018 (`Macmini8,1`) remains experimental:** its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. In a physical test, changing only the second byte to `64` produced **no visible LED change**; the original `2F FF` was restored. The register's meaning remains unknown, so normal commands and installation remain disabled on Intel.
+**Intel Mac mini 2018 (`Macmini8,1`) remains experimental:** its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. Physical tests of `LSLN` values `20 FF`, `40 FF`, and `2F 64` produced **no visible LED change**; the original `2F FF` was restored after each. The register's meaning remains unknown, so normal commands and installation remain disabled on Intel.
 
 **Intel multi-test workflow:** `--intel-suite` runs three 2-second probes on the first and second bytes in order: `2F FF → 20 FF`, `2F FF → 40 FF`, and `2F FF → 2F 64`. It restores and verifies `2F FF` after **each** test and aborts if restoration fails. `--intel-probe first|second <decimal-value>` lets you select additional probes without rebuilding; first-byte values are limited to **32–64**. `--intel-snapshot` reads related SMC keys without writing. Watch the LED during each stage; SMC readback alone does not prove any visual change.
 
