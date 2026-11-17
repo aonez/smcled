@@ -70,7 +70,7 @@ sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Macmini8,1
 
 Steady amber and white brightness have been physically verified on the M1 mini and M4 Max Studio. Flashing modes have only been tested on the M1 mini.
 
-**Intel Mac mini 2018 (`Macmini8,1`) remains experimental:** its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. `--test-intel-brightness 100 --confirm-hardware-test` temporarily changes only the second byte, then restores `2F FF`. The effect is unknown until tested; normal commands and installation remain disabled on Intel.
+**Intel Mac mini 2018 (`Macmini8,1`) remains experimental:** its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. In a physical test, changing only the second byte to `64` produced **no visible LED change**; the original `2F FF` was restored. The register's meaning remains unknown, so normal commands and installation remain disabled on Intel.
 
 For a recognized but untested M2/M3/M4 mini or Studio:
 
