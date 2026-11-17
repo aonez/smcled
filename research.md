@@ -695,3 +695,11 @@ On `Macmini8,1`, user ran `--intel-snapshot` and `--intel-suite --confirm-hardwa
 - `2F FF` -> `2F 64` -> `2F FF`: **no visible brightness change** (reproducing prior outcome).
 
 All reported read-only key snapshots after each stage matched the initial baseline. User explicitly reported no visual change in any stage. This does **not** establish that these keys are irrelevant in all conditions, but there is no evidence here that `LSLN` drives the physical LED on the Intel mini. Stop blind SMC write experiments; seek device/firmware-specific evidence before any new Intel write tests. Intel normal LED commands and installation stay disabled.
+
+## 17 November 2026 — Startup retries and opt-in for future Apple Silicon desktops
+
+`applyInstalledBrightness()` now enters the bounded boot-time retry loop **before** opening/checking AppleSMC. This fixes the case where an early AppleSMC failure previously bypassed all 15 retries. The loop passes the opened SMC connection to the model/key guard before applying saved mode.
+
+`--accept-untested-model` remains required for all recognized but unverified M1–M4 mini/Studio models. It now also allows **unlisted future Apple Silicon Mac mini or Mac Studio models** only if: `hw.model` matches the modern `MacN,N` syntax, `hw.optional.arm64` confirms Apple Silicon, `/usr/sbin/system_profiler SPHardwareDataType -json` reports the same model ID and a `Mac mini` or `Mac Studio` product family, the SMC full key signature matches the verified profile, and the current brightness/channel readback looks plausible. The flag is persisted into the LaunchDaemon command on unverified models. Intel models and other product families remain blocked. The tool makes no assertion that future hardware is physically verified.
+
+The new unknown-model product-family check invokes the OS system profiler with a bounded 10-second timeout. If it is unavailable or cannot identify the family, no write is allowed. The diagnostic `--compatibility-self-test` now covers future model-ID syntax.
