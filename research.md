@@ -674,3 +674,14 @@ Apple Silicon Mac mini and Studio identifiers covering M1–M4 are recognized in
 
 - **Mac Studio M4 Max (`Mac16,9`):** The user ran the normal, newly enabled commands `sudo ./smcled --amber 100` and `sudo ./smcled --white 255`. Both worked visually as expected. Together with the earlier white brightness and reversible amber diagnostic tests, this **physically verifies manual white and steady amber switching on `Mac16,9`**. The user expressly chose **not** to install the LaunchDaemon on the Studio, so persistent auto mode on this machine is **not yet tested**. Flashing patterns on Studio have also **not** been tested.
 - **Mac mini 2018 (`Macmini8,1`):** `sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test` changed the observed `LSLN` bytes from `2F FF` to `2F 64` for two seconds, then restored `2F FF`. The user saw **no visible LED brightness change**. This does not establish that the first byte controls brightness or that the machine cannot be dimmed; the encoding and effects of undocumented keys remain unknown. Keep normal Intel LED writes and installation disabled.
+
+## 17 November 2026 — Intel multi-test diagnostics in one build
+
+New Macmini8,1-only diagnostic commands:
+
+- `--intel-snapshot`: read-only inventory of LED-related SMC keys, reporting unavailable keys without writes.
+- `--intel-suite --confirm-hardware-test`: three sequential, reversible two-second `LSLN` experiments: `2F FF → 20 FF` (first byte), `2F FF → 40 FF` (first byte), then `2F FF → 2F 64` (second byte, previous no-visible-effect control).
+- `--intel-probe first|second <0...255> --confirm-hardware-test`: selectable reversible test without rebuilding. First-byte values limited to decimal 32–64 because the first byte has not previously been modified on this model.
+- The prior `--test-intel-brightness` remains available, using the common probe engine.
+
+Every stage verifies the observed baseline `2F FF`, samples the test value, and attempts to restore and re-read the exact baseline before continuing. A failed restore stops subsequent probes; there is an additional best-effort restore on exit. `SIGINT`/`SIGTERM` are handled through the existing diagnostic cancellation object, but crash, SIGKILL, and power loss cannot guarantee restoration. Only `LSLN` is ever written. No Intel support is granted for ordinary or persistent LED changes. **No first-byte hardware experiment has yet been run.**
