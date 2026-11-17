@@ -662,3 +662,10 @@ The CLI now includes `--compatibility` (read-only), `--compatibility-self-test` 
 ### Pending Mac Studio amber probe
 
 A guarded `--test-studio-amber --confirm-hardware-test` command was added for `Mac16,9` only. It requires root, no loaded smcled job, full SMC signature, initial white channel (`LSCS=00`, `LS1P=0000`) and symmetric brightness. After dimming white to zero, it sends only the M1-tested steady amber preset (`LSSB=04 00`) and checks channel telemetry. If the channel responds as expected, it displays brightness 100 for 1.5 seconds. A `defer` attempts to return to white using `LSRB` and the saved `LSLN`. SIGINT/SIGTERM use the existing cancellation handler; process crash, SIGKILL, or a power interruption can defeat restoration. **Mac Studio amber and restore behavior are still unverified until observed physically.** No regular write permissions were expanded.
+## 17 November 2026 — Mac Studio amber and guarded family support
+
+**Mac Studio M4 Max (`Mac16,9`) passed the physical amber test.** Initially `LSCS=00 LS0P=A3 B2 LS1P=00 00 LSLN=FF FF`. The `LSSB=04 00` preset selected channel 1 and visually produced amber. At `LSLN=64 64`, `LS1P=41 A9`. After restoration, `LSCS=00` and `LSLN=FF FF`; `LS0P=00 00` at the immediate sample may indicate delayed PWM settling. The user reports correct restoration.
+
+Apple Silicon Mac mini and Studio identifiers covering M1–M4 are recognized in the normal command paths, with full SMC metadata validation. Only `Macmini9,1` and `Mac16,9` have confirmed physical behavior. Other listed models must pass `--accept-untested-model`; their installed daemon records this acknowledgement. Unknown newer model IDs stay blocked pending review. Flashing presets on Mac Studio remain unverified.
+
+**Mac mini 2018 (`Macmini8,1`)** returned stable asymmetric `LSLN=2F FF` in ten samples. Encoding remains unknown. An explicitly experimental `--test-intel-brightness` command alters only byte 2 for two seconds and restores both original bytes. It does not enable permanent Intel control, and a failed process or power loss could prevent restoration.
