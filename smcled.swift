@@ -234,6 +234,11 @@ func reportCompatibility() throws {
     if let brightness = keys["LSLN"], brightness.readable,
        brightness.size == 2, let bytes = try? smc.read("LSLN") {
         print("Current brightness register: \(hex(bytes))")
+        if bytes.count == 2 && bytes[0] != bytes[1] {
+            print("  Note: LSLN bytes differ; their meaning on this Mac is unverified.")
+            print("  The reversible brightness write test will refuse to run.")
+            print("  Use --sample-brightness to inspect changes without writing.")
+        }
     }
     if level == .verified {
         print("Standard LED commands are enabled for Macmini9,1.")
@@ -244,6 +249,23 @@ func reportCompatibility() throws {
         print("SMC metadata cannot prove physical LED response or amber support.")
         print("Normal LED writes and installation remain restricted to Macmini9,1.")
     }
+}
+
+// Read-only sampling can show whether an unusual brightness register changes
+// over time; it must not be used to infer the meaning of the two bytes.
+func sampleBrightnessRegister() throws {
+    let smc = try SMC()
+    let info = try smc.info("LSLN")
+    guard info.size == 2, info.type == "ui16", info.readable else {
+        throw ToolError("LSLN is not a readable two-byte ui16 key")
+    }
+    print("Read-only LSLN samples on \(modelID()) (no SMC writes):")
+    for i in 0..<10 {
+        let bytes = try smc.read("LSLN")
+        print(String(format: "+%.1fs", Double(i) * 0.5) + "  \(hex(bytes))")
+        if i < 9 { Thread.sleep(forTimeInterval: 0.5) }
+    }
+    print("The samples do not establish how the bytes map to physical brightness.")
 }
 
 // Pure self-tests exercise the classification logic without touching AppleSMC.
@@ -912,7 +934,7 @@ func testBrightnessCandidate(_ candidate: UInt8) throws {
     }
     let original = try smc.read("LSLN")
     guard original.count == 2, original[0] == original[1] else {
-        throw ToolError("Unexpected LSLN=\(hex(original)); refusing test")
+        throw ToolError("LSLN bytes are asymmetric (\(hex(original))); refusing writes. Use --sample-brightness for a read-only investigation")
     }
     let requested = [candidate, candidate]
     guard original != requested else {
@@ -1429,6 +1451,7 @@ func usage() {
       sudo smcled --uninstall            Remove daemon, files, symlink; reset LED
 
       smcled --compatibility             Read-only hardware capability report
+      smcled --sample-brightness         Read LSLN repeatedly, without writes
       smcled --compatibility-self-test   Offline signature classification tests
       sudo smcled --test-brightness 100 --confirm-hardware-test
                                           Reversible LSLN probe on candidate models
@@ -1490,6 +1513,10 @@ func run(_ arguments: [String]) throws {
     case "--compatibility":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility") }
         try reportCompatibility()
+        return
+    case "--sample-brightness":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --sample-brightness") }
+        try sampleBrightnessRegister()
         return
     case "--compatibility-self-test":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility-self-test") }
