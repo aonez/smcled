@@ -4,7 +4,7 @@ Control the **white and amber status LED** of Apple Silicon **Mac mini and Mac S
 
 Written in Swift using AppleSMC/IOKit. No third-party dependencies, SIP changes, or internet connection required.
 
-**Hardware verified:** M1 Mac mini (`Macmini9,1`) and M4 Max Mac Studio (`Mac16,9`) for white brightness and steady amber. Other Apple Silicon Mac mini/Studio models from M1–M4 require experimental acknowledgement.
+**Hardware verified:** M1 Mac mini (`Macmini9,1`) and M4 Max Mac Studio (`Mac16,9`) for manual white brightness and steady amber. Other M1–M4 models, and future Apple Silicon Mac mini/Studio models, require explicit experimental acknowledgement.
 
 ## Build
 
@@ -70,7 +70,7 @@ sudo ./smcled --intel-probe second 100 --confirm-hardware-test
 sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Legacy second-byte probe
 ```
 
-`--compatibility` reports SMC metadata, not proof of physical LED behavior. M1–M4 Apple Silicon Mac mini/Studio models are recognized by identifier and require the complete LED key signature. **Untested models require** `--accept-untested-model` on write or installation commands. Unknown newer models stay blocked pending an updated profile.
+`--compatibility` reports SMC metadata, not proof of physical LED behavior. M1–M4 Apple Silicon Mac mini/Studio models are recognized by identifier and require the complete LED key signature. **Untested models require** `--accept-untested-model` on write or installation commands. For unknown future model IDs, the tool additionally verifies Apple Silicon hardware, the Mac mini/Studio product family reported by macOS, a full SMC key signature, and plausible initial LED state. The flag never enables Intel or unrelated Mac families.
 
 Steady amber and white brightness have been physically verified on the M1 mini and M4 Max Studio. Flashing modes have only been tested on the M1 mini.
 
@@ -78,9 +78,9 @@ Steady amber and white brightness have been physically verified on the M1 mini a
 
 **Intel multi-test workflow:** `--intel-suite` runs three 2-second probes on the first and second bytes in order: `2F FF → 20 FF`, `2F FF → 40 FF`, and `2F FF → 2F 64`. It restores and verifies `2F FF` after **each** test and aborts if restoration fails. `--intel-probe first|second <decimal-value>` lets you select additional probes without rebuilding; first-byte values are limited to **32–64**. `--intel-snapshot` reads related SMC keys without writing. Watch the LED during each stage; SMC readback alone does not prove any visual change.
 
-**Warning:** The first byte has never been modified on this Intel model, and its meaning is unknown. These are experimental writes to an undocumented controller, not proven-safe brightness commands. Run only with physical access; a crash or power failure can prevent restoration.
+**Warning:** Neither first-byte nor second-byte experiments produced a visible LED change on the tested Intel mini. These are writes to an undocumented controller, not proven brightness commands. Run only with physical access; a crash or power failure can prevent restoration.
 
-For a recognized but untested M2/M3/M4 mini or Studio:
+For an untested Apple Silicon Mac mini or Mac Studio (including newer generations):
 
 ```sh
 sudo ./smcled --white 100 --accept-untested-model
@@ -89,6 +89,7 @@ sudo ./smcled --install-auto 300 --accept-untested-model
 
 ## Notes
 
+- Startup recovery retries SMC initialization and LED writes together (up to 15 attempts), rather than giving up before the first check.
 - Requires `sudo` to change the LED; previews and status do not.
 - The tested SMC controls cannot blend white and amber simultaneously.
 - **Sleep resets the LED to fixed white at 255** on the tested Mac mini. No wake listener is installed; after wake, the next scheduled check reapplies the correct state. Restoration is not necessarily immediate.
