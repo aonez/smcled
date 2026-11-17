@@ -685,3 +685,13 @@ New Macmini8,1-only diagnostic commands:
 - The prior `--test-intel-brightness` remains available, using the common probe engine.
 
 Every stage verifies the observed baseline `2F FF`, samples the test value, and attempts to restore and re-read the exact baseline before continuing. A failed restore stops subsequent probes; there is an additional best-effort restore on exit. `SIGINT`/`SIGTERM` are handled through the existing diagnostic cancellation object, but crash, SIGKILL, and power loss cannot guarantee restoration. Only `LSLN` is ever written. No Intel support is granted for ordinary or persistent LED changes. **No first-byte hardware experiment has yet been run.**
+
+## 17 November 2026 — Intel three-stage physical observation
+
+On `Macmini8,1`, user ran `--intel-snapshot` and `--intel-suite --confirm-hardware-test` successfully. `LSLN` was initially `2F FF`; other read-only keys included `LSLB=FF FF`, `LSLF=00 00`, `LS0C=FF FF`, `LSOF=00`, and `LSSE=01`. `LS0P`, `LS0S`, `LS1C`, `LS1P`, `LS1S`, `LSCS` were unavailable. Three steps accepted their respective values and restored the original `LSLN` after each:
+
+- `2F FF` -> `20 FF` -> `2F FF`: **no visible brightness change**.
+- `2F FF` -> `40 FF` -> `2F FF`: **no visible brightness change**.
+- `2F FF` -> `2F 64` -> `2F FF`: **no visible brightness change** (reproducing prior outcome).
+
+All reported read-only key snapshots after each stage matched the initial baseline. User explicitly reported no visual change in any stage. This does **not** establish that these keys are irrelevant in all conditions, but there is no evidence here that `LSLN` drives the physical LED on the Intel mini. Stop blind SMC write experiments; seek device/firmware-specific evidence before any new Intel write tests. Intel normal LED commands and installation stay disabled.
