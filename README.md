@@ -60,12 +60,13 @@ Fixed startup settings are also available, e.g. `sudo ./smcled --install amber 1
 ```sh
 ./smcled --compatibility             # Read-only SMC key check
 ./smcled --compatibility-self-test   # Offline classification self-tests
+./smcled --sample-brightness         # Read-only LSLN samples
 sudo ./smcled --test-brightness 100 --confirm-hardware-test
 ```
 
 `--compatibility` identifies a **verified**, **full key-set candidate**, **brightness-register candidate**, or **unsupported** interface. A candidate is **not** proof that the physical LED works. The optional brightness test writes only `LSLN` for 2 seconds and restores its original value; observe the LED to confirm. It does not alter the installed configuration. No automatic installation or amber switching is enabled on unverified hardware.
 
-Preliminary SMC checks: `Mac16,9` (Mac Studio M4 Max) matches all M1 keys; `Macmini8,1` (2018 Mac mini) has `LSLN`, `LSSB` and `LSRB` but no `LSCS`/`LS0P`/`LS1P` telemetry. **Neither has been physically validated.**
+Preliminary SMC checks: `Mac16,9` (Mac Studio M4 Max) matches all M1 keys; `Macmini8,1` (2018 Mac mini) has `LSLN`, `LSSB` and `LSRB` but no `LSCS`/`LS0P`/`LS1P` telemetry. **Mac Studio white LED brightness is now physically verified (255 → 100 → 255); amber is not.** The 2018 Mac mini returned asymmetric `LSLN=2F FF` and the write test correctly refused to run. Do not bypass that safeguard.
 
 ## Notes
 
