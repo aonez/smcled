@@ -724,3 +724,26 @@ The historical Apple SMC key descriptions in [floe/smc_util docs](https://github
 The provided J174 MacEFI IMG4 image contains 32-bit x86 instructions at file offsets \`0x69769F\` and \`0x6976B8\` that load reversed four-character constants for SMC keys \`LSCS\` and \`LSSB\`, then call a local helper at \`0x69745A\`. Another function refers to \`LSOF\` at \`0x69773C\`. The same instructions repeat in the second firmware bank at an offset of +0x800000. This confirms firmware references to these keys but **does not** prove the handlers are exposed to macOS: \`LSCS\` was absent from the T2 mini's OS-visible SMC inventory. The decompressed bridgeOS kernelcache contains AppleSMC communication classes but no obvious plaintext 4CC literals for these specific LED keys.
 
 No LuxMini code or private profile information was used in this investigation. Do not attempt to mutate \`LSOO\`, \`LSRB\`, \`LSSB\`, \`LSLB\`, or \`LSSV\` solely on the basis of these historical descriptions. The next test is a read-only SMC snapshot, particularly \`LSPV\` and \`LSSV\`.
+
+
+## 17 November 2026 — Intel live PWM baseline after full `LS*` inventory
+
+User measured on physical `Macmini8,1` (macOS 15.8.2, T2 bridgeOS 24P6005):
+
+| Key | Raw | Interpretation status |
+| --- | --- | --- |
+| `LSLB` | `FF FF` | Historical full-on PWM preset |
+| `LSLF` | `00 00` | Historical off PWM preset |
+| `LSLN` | `2F FF` | Historical on PWM preset |
+| `LSPV` | `14 11` | Historical actual PWM, constant across five readings spaced 0.5 s |
+| `LSOF` | `00` | Historical "off" indicator; consistent with an on LED |
+| `LSSV` | `08 6B` | Historical brightness-scale variable, precise current T2 meaning not independently verified |
+| `LSSE` | `01` | Historical per-unit scaling enabled |
+| `LS0C` | `FF FF` | Unknown significance on this model |
+| `LSFD`, `LSFU` | `34 BC 00 01 00 11` | Matching fade-structure bytes; historical flare presets |
+
+Important: `LSPV` differs from `LSLB` and `LSLN` but **this is not conclusive about the selected preset** because `LSSE=01` indicates scaling and the reference lists behavior transitions / ramps. Historical `{pwm` is a 16-bit PWM value; do not interpret each byte separately as independent channels on this Intel model.
+
+**Next controlled experiment:** observe read-only `LSPV` at approximately 100–200 ms intervals *during* the already-tested reversible `LSLN` suite. Correlation (or its absence) will establish whether `LSLN` changes propagate into the reported live PWM. Do not write `LSLB`, `LSOO`, `LSSV`, `LSSE`, `LSSB`, or `LSUP` until supported by further independent evidence. Changing `LSLN` was already completed without visible effect on this particular machine, but no user test is risk-free.
+
+Independent reference: https://github.com/floe/smc_util/blob/master/docs/readme.md (historic SIL key semantics, not guaranteed for T2).
