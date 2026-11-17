@@ -4,7 +4,7 @@ Control the **white and amber status LED** of the **M1 Mac mini** from Terminal.
 
 Written in Swift using AppleSMC/IOKit. No third-party dependencies, SIP changes, or internet connection required.
 
-**Tested hardware:** Mac mini (M1, 2020), `Macmini9,1` (j274). Other models are not supported or tested.
+**Hardware verified:** Mac mini (M1, 2020), `Macmini9,1` (j274). Other models can be inspected but are not yet enabled for LED control.
 
 ## Build
 
@@ -55,8 +55,19 @@ Solar times are calculated offline using the city configured in macOS (`/Library
 
 Fixed startup settings are also available, e.g. `sudo ./smcled --install amber 100`.
 
-## Notes
+## Check another Mac
 
+```sh
+./smcled --compatibility             # Read-only SMC key check
+./smcled --compatibility-self-test   # Offline classification self-tests
+sudo ./smcled --test-brightness 100 --confirm-hardware-test
+```
+
+`--compatibility` identifies a **verified**, **full key-set candidate**, **brightness-register candidate**, or **unsupported** interface. A candidate is **not** proof that the physical LED works. The optional brightness test writes only `LSLN` for 2 seconds and restores its original value; observe the LED to confirm. It does not alter the installed configuration. No automatic installation or amber switching is enabled on unverified hardware.
+
+Preliminary SMC checks: `Mac16,9` (Mac Studio M4 Max) matches all M1 keys; `Macmini8,1` (2018 Mac mini) has `LSLN`, `LSSB` and `LSRB` but no `LSCS`/`LS0P`/`LS1P` telemetry. **Neither has been physically validated.**
+
+## Notes
 - Requires `sudo` to change the LED; previews and status do not.
 - The tested SMC controls cannot blend white and amber simultaneously.
 - **Sleep resets the LED to fixed white at 255** on the tested Mac mini. No wake listener is installed; after wake, the next scheduled check reapplies the correct state. Restoration is not necessarily immediate.
