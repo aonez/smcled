@@ -316,6 +316,14 @@ func compatibilitySelfTest() throws {
         throw ToolError("Intel LSLN byte-selection self-test failed")
     }
     print("PASS: Intel byte-selection logic preserves the other byte")
+    guard looksLikeModernMacIdentifier("Mac17,9"),
+          looksLikeModernMacIdentifier("Mac27,12"),
+          !looksLikeModernMacIdentifier("Macmini8,1"),
+          !looksLikeModernMacIdentifier("MacBookPro19,1"),
+          !looksLikeModernMacIdentifier("Mac17,9-extra") else {
+        throw ToolError("Future-model identifier syntax self-test failed")
+    }
+    print("PASS: future model ID syntax guard")
     print("Compatibility self-tests passed (no SMC access).")
 }
 
@@ -1897,7 +1905,7 @@ func run(_ originalArguments: [String]) throws {
         }
         try runIntelLSLNExperiments([
             IntelLSLNExperiment(byte: byte, value: try brightnessNumber(arguments[2]),
-                                 label: "(byte.rawValue) byte")
+                                 label: "\(byte.rawValue) byte")
         ])
         return
     case "--test-intel-brightness":
