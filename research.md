@@ -703,3 +703,24 @@ All reported read-only key snapshots after each stage matched the initial baseli
 `--accept-untested-model` remains required for all recognized but unverified M1–M4 mini/Studio models. It now also allows **unlisted future Apple Silicon Mac mini or Mac Studio models** only if: `hw.model` matches the modern `MacN,N` syntax, `hw.optional.arm64` confirms Apple Silicon, `/usr/sbin/system_profiler SPHardwareDataType -json` reports the same model ID and a `Mac mini` or `Mac Studio` product family, the SMC full key signature matches the verified profile, and the current brightness/channel readback looks plausible. The flag is persisted into the LaunchDaemon command on unverified models. Intel models and other product families remain blocked. The tool makes no assertion that future hardware is physically verified.
 
 The new unknown-model product-family check invokes the OS system profiler with a bounded 10-second timeout. If it is unavailable or cannot identify the family, no write is allowed. The diagnostic `--compatibility-self-test` now covers future model-ID syntax.
+
+
+## 17 November 2026 — Intel T2 SIL state investigation (independent research)
+
+### Evidence from Macmini8,1 hardware
+
+The complete read-only \`LS*\` key inventory included \`LSLN\` (ui16, 2, C0), \`LSLB\` (ui16, 2, C0), \`LSLF\` (ui16, 2, C0), \`LSPV\` (ui16, 2, 80), \`LSOF\` (flag, 1, 80), \`LSOO\` (flag, 1, 50), \`LSRB\` (flag, 1, 50), \`LSSB\` (hex_, 2, 50), \`LSSV\` (ui16, 2, C4), and \`LSSE\` (flag, 1, C0), among other keys. At the observed baseline \`LSLN=2F FF\`, \`LSLB=FF FF\`, \`LSLF=00 00\`, \`LSOF=00\`, \`LSSE=01\`.
+
+The hardware accepted temporary \`LSLN=20 FF\`, \`40 FF\`, and \`2F 64\` but the user saw **no visible LED change** in any stage; \`LSLN=2F FF\` was restored after each test.
+
+### Independent public SIL documentation
+
+The historical Apple SMC key descriptions in [floe/smc_util docs](https://github.com/floe/smc_util/blob/master/docs/readme.md) describe \`LSLN\` as SIL PWM "On", \`LSLB\` as PWM "Full On", \`LSLF\` as PWM "Off", and \`LSPV\` as current PWM. \`LSOF\` indicates whether the SIL is off, \`LSOO\` is an on/off override, \`LSRB\` restores SMC state-machine behavior, \`LSSV\` is a per-unit maximum-brightness scale, and \`LSSE\` enables such scaling. These are *historical descriptions*, not confirmed T2 firmware semantics.
+
+**Hypothesis (not yet established):** the 2018 mini's front LED may currently be in "Full On" behavior using \`LSLB\` (FF FF) rather than the "On" behavior using \`LSLN\` (2F FF). This could explain why writes to \`LSLN\` had no visible effect. The read-only \`LSPV\` register is the next discriminator: compare \`LSPV\` to both \`LSLB\` and \`LSLN\` before considering *any* further write.
+
+### Independent J174 firmware evidence
+
+The provided J174 MacEFI IMG4 image contains 32-bit x86 instructions at file offsets \`0x69769F\` and \`0x6976B8\` that load reversed four-character constants for SMC keys \`LSCS\` and \`LSSB\`, then call a local helper at \`0x69745A\`. Another function refers to \`LSOF\` at \`0x69773C\`. The same instructions repeat in the second firmware bank at an offset of +0x800000. This confirms firmware references to these keys but **does not** prove the handlers are exposed to macOS: \`LSCS\` was absent from the T2 mini's OS-visible SMC inventory. The decompressed bridgeOS kernelcache contains AppleSMC communication classes but no obvious plaintext 4CC literals for these specific LED keys.
+
+No LuxMini code or private profile information was used in this investigation. Do not attempt to mutate \`LSOO\`, \`LSRB\`, \`LSSB\`, \`LSLB\`, or \`LSSV\` solely on the basis of these historical descriptions. The next test is a read-only SMC snapshot, particularly \`LSPV\` and \`LSSV\`.
