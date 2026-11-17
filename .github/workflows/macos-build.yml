@@ -1,0 +1,19 @@
+name: macOS build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  swift:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build smcled
+        run: swiftc -O smcled.swift -framework IOKit -o smcled
+      - name: Run hardware-free compatibility tests
+        run: ./smcled --compatibility-self-test
+      - name: Verify CLI help
+        run: ./smcled --help
