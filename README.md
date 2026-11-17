@@ -1,10 +1,10 @@
 # smcled
 
-Control the **white and amber status LED** of the **M1 Mac mini** from Terminal. Set brightness (0–255), select a color or blinking pattern, or automatically adjust the LED around sunrise and sunset.
+Control the **white and amber status LED** of Apple Silicon **Mac mini and Mac Studio** computers from Terminal. Set brightness (0–255), select a color or blinking pattern, or automatically adjust the LED around sunrise and sunset.
 
 Written in Swift using AppleSMC/IOKit. No third-party dependencies, SIP changes, or internet connection required.
 
-**Hardware verified:** Mac mini (M1, 2020), `Macmini9,1` (j274). Other models can be inspected but are not yet enabled for LED control.
+**Hardware verified:** M1 Mac mini (`Macmini9,1`) and M4 Max Mac Studio (`Mac16,9`) for white brightness and steady amber. Other Apple Silicon Mac mini/Studio models from M1–M4 require experimental acknowledgement.
 
 ## Build
 
@@ -63,11 +63,21 @@ Fixed startup settings are also available, e.g. `sudo ./smcled --install amber 1
 ./smcled --sample-brightness         # Read-only LSLN samples
 sudo ./smcled --test-brightness 100 --confirm-hardware-test
 sudo ./smcled --test-studio-amber --confirm-hardware-test  # Mac16,9 only
+sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Macmini8,1
 ```
 
-`--compatibility` identifies a **verified**, **full key-set candidate**, **brightness-register candidate**, or **unsupported** interface. A candidate is **not** proof that the physical LED works. The optional brightness test writes only `LSLN` for 2 seconds and restores its original value; observe the LED to confirm. It does not alter the installed configuration. `--test-studio-amber` is a separate experimental Mac Studio-only test: temporarily switch to LSSB preset 4, show LED at 100 for 1.5 seconds if channel telemetry matches, then attempt restoration through LSRB. Use with physical access to the Mac because the Studio's preset/restore behavior is not yet verified. Normal amber switching and automatic installation remain restricted to the hardware-verified M1 mini.
+`--compatibility` reports SMC metadata, not proof of physical LED behavior. M1–M4 Apple Silicon Mac mini/Studio models are recognized by identifier and require the complete LED key signature. **Untested models require** `--accept-untested-model` on write or installation commands. Unknown newer models stay blocked pending an updated profile.
 
-Preliminary SMC checks: `Mac16,9` (Mac Studio M4 Max) matches all M1 keys; `Macmini8,1` (2018 Mac mini) has `LSLN`, `LSSB` and `LSRB` but no `LSCS`/`LS0P`/`LS1P` telemetry. **Mac Studio white LED brightness is now physically verified (255 → 100 → 255); amber is not.** The 2018 Mac mini returned asymmetric `LSLN=2F FF` and the write test correctly refused to run. Do not bypass that safeguard.
+Steady amber and white brightness have been physically verified on the M1 mini and M4 Max Studio. Flashing modes have only been tested on the M1 mini.
+
+**Intel Mac mini 2018 (`Macmini8,1`) remains experimental:** its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. `--test-intel-brightness 100 --confirm-hardware-test` temporarily changes only the second byte, then restores `2F FF`. The effect is unknown until tested; normal commands and installation remain disabled on Intel.
+
+For a recognized but untested M2/M3/M4 mini or Studio:
+
+```sh
+sudo ./smcled --white 100 --accept-untested-model
+sudo ./smcled --install-auto 300 --accept-untested-model
+```
 
 ## Notes
 
