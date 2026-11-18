@@ -1,4 +1,4 @@
-// smcled.swift — AppleSMC power LED CLI for Apple Silicon Mac mini and Studio
+// smcled.swift — AppleSMC status LED CLI for supported Mac mini and Mac Studio
 // No Apple-private headers, third-party dependencies, kext, or SIP changes.
 // Verified on Macmini9,1: white PWM and three amber presets.
 // Confirmed: LSLN controls brightness on steady amber (tested at 10 and 50).
@@ -218,6 +218,14 @@ func readCompatibilityKeys(_ smc: SMC) -> [String: KeyInfo] {
 func reportCompatibility() throws {
     let smc = try SMC()
     let model = modelID()
+    if model == "Macmini8,1" {
+        print("Mac model: \(model)")
+        print("SMC LED interface: Intel T2 (off/full-white/normal-white physically verified on one unit)")
+        print("  Available: --off, --intel-full, --reset, --intel-restore, --white [0...255], --intel-brightness <0...255>")
+        print("  Manual 0...255 levels and white-only --install-auto are supported; amber/color and fixed-mode installation remain disabled.")
+        try intelSILStatus()
+        return
+    }
     let keys = readCompatibilityKeys(smc)
     let level = compatibilityLevel(model, keys)
     print("Mac model: \(model)")
@@ -316,6 +324,114 @@ func compatibilitySelfTest() throws {
         throw ToolError("Intel LSLN byte-selection self-test failed")
     }
     print("PASS: Intel byte-selection logic preserves the other byte")
+    // Pure arithmetic checks against physically measured Intel PWM points.
+    let intelPoints: [([UInt8], Int)] = [
+        ([0x00, 0x00], 0),
+        ([0x08, 0x00], 0x0358),
+        ([0x10, 0x00], 0x06B0),
+        ([0x20, 0x00], 0x0D61),
+        ([0x7F, 0xFF], 0x3584),
+        ([0xFF, 0xFF], 0x6B08)
+    ]
+    for (preset, measuredPWM) in intelPoints {
+        let calculated = intelPWMExpected(preset)
+        guard abs(calculated - measuredPWM) <= 3 else {
+            throw ToolError("Intel PWM estimation self-test failed: LSLB=\(hex(preset)), expected ~\(measuredPWM), got \(calculated)")
+        }
+    }
+    guard intelPWMExpected([0x00, 0x00]) == 0,
+          intelPWMExpected([0xFF, 0xFF]) == 0x6B08,
+          intelPWMExpected([50, 50]) > intelPWMExpected([16, 16]) else {
+        throw ToolError("Intel 0...255 level scaling self-test failed")
+    }
+    print("PASS: Intel 0...255 PWM mapping matches hardware samples within 3 counts")
+    guard intelManualOverrideActive(preset: [10, 10], pwm: [0x04, 0x32], off: [0]),
+          intelManualOverrideActive(preset: [50, 50], pwm: [0x14, 0xFD], off: [0]),
+          !intelManualOverrideActive(preset: [0xFF, 0xFF], pwm: intelNormalPWM, off: [0]),
+          !intelManualOverrideActive(preset: [10, 10], pwm: [0, 0], off: [1]) else {
+        throw ToolError("Intel manual override classification self-test failed")
+    }
+    print("PASS: Intel active brightness override classification")
+    let fadeCases: [(Int, Int)] = [(0, 65535), (65535, 0), (0x2FFF, 0x101),
+                                  (0x101, 0x505), (0x505, 0x505)]
+    for (from, to) in fadeCases {
+        let count = 60
+        let values = (0...count).map {
+            intelFadePreset(from: from, to: to, step: $0, steps: count)
+        }
+        guard values.first == from, values.last == to else {
+            throw ToolError("Intel fade endpoint test failed: \(from) -> \(to)")
+        }
+        for i in 1..<values.count {
+            guard (to >= from ? values[i] >= values[i - 1] : values[i] <= values[i - 1]) else {
+                throw ToolError("Intel fade monotonicity test failed")
+            }
+        }
+    }
+    print("PASS: Intel 16-bit fade endpoints and monotonic steps")
+    let timings: [(Double, Double, Double)] = [
+        (0, 255, 1), (10, 20, 10.0 / 255),
+        (10, 200, 190.0 / 255), (200, 10, 190.0 / 255),
+        (1, 1, 0)
+    ]
+    for (start, end, expected) in timings {
+        guard abs(proportionalFadeSeconds(from: start, to: end) - expected) < 0.000001 else {
+            throw ToolError("Proportional fade timing self-test failed: \(start) -> \(end)")
+        }
+    }
+    guard fadeStepCount(for: 10.0 / 255) >= 1,
+          fadeStepCount(for: 1) <= 180 else {
+        throw ToolError("Proportional fade step count self-test failed")
+    }
+    print("PASS: Relative one-second full-range fade timing")
+    // Deterministic solar-day tests, no system location/SMC access.
+    let utc = TimeZone(secondsFromGMT: 0)!
+    let calendar = configuredCalendar(utc)
+    let sunrise = Date(timeIntervalSince1970: 6 * 3600)
+    let sunset = Date(timeIntervalSince1970: 20 * 3600)
+    let day = SolarDay(sunrise: sunrise, sunset: sunset)
+    let intelEvents = automaticTransitions(for: day, calendar: calendar, model: "Macmini8,1")
+    let appleEvents = automaticTransitions(for: day, calendar: calendar, model: "Macmini9,1")
+    let intelExpected: [(TimeInterval, UInt8)] = [
+        (sunrise.timeIntervalSince1970 - 3600, 33),
+        (sunrise.timeIntervalSince1970, 50),
+        (sunrise.timeIntervalSince1970 + 3600, 100),
+        (sunrise.timeIntervalSince1970 + 7200, 255),
+        (sunset.timeIntervalSince1970, 100),
+        (sunset.timeIntervalSince1970 + 3600, 50),
+        (sunset.timeIntervalSince1970 + 14400, 33)
+    ]
+    guard intelEvents.count == 7,
+          zip(intelEvents, intelExpected).allSatisfy({
+              $0.0.mode == .white &&
+              $0.0.brightness == $0.1.1 &&
+              $0.0.date.timeIntervalSince1970 == $0.1.0
+          }) else {
+        throw ToolError("Intel white-only seven-stage solar schedule self-test failed")
+    }
+    guard appleEvents.count == 6,
+          appleEvents.map({ $0.brightness }) == [100, 33, 255, 100, 255, 33],
+          appleEvents.map({ $0.mode }) == [.amber, .white, .white, .white, .amber, .amber],
+          appleEvents.map({ $0.date.timeIntervalSince1970 }) ==
+            [sunrise.timeIntervalSince1970 - 3600,
+             sunrise.timeIntervalSince1970,
+             sunrise.timeIntervalSince1970 + 3600,
+             sunset.timeIntervalSince1970,
+             sunset.timeIntervalSince1970 + 3600,
+             sunset.timeIntervalSince1970 + 14400] else {
+        throw ToolError("Apple Silicon original solar schedule self-test failed")
+    }
+    let lateSunset = Date(timeIntervalSince1970: 21 * 3600)
+    let lateDay = SolarDay(sunrise: sunrise, sunset: lateSunset)
+    for model in ["Macmini8,1", "Macmini9,1"] {
+        let lateEvents = automaticTransitions(for: lateDay, calendar: calendar, model: model)
+        guard lateEvents.last?.date == lateSunset.addingTimeInterval(10800),
+              lateEvents.last?.brightness == 33 else {
+            throw ToolError("Late-sunset +3h auto schedule self-test failed on \(model)")
+        }
+    }
+    print("PASS: Intel 7-stage white-only schedule; Apple Silicon 6-stage schedule unchanged")
+    print("PASS: late-sunset +3h timing on both architectures")
     guard looksLikeModernMacIdentifier("Mac17,9"),
           looksLikeModernMacIdentifier("Mac27,12"),
           !looksLikeModernMacIdentifier("Macmini8,1"),
@@ -410,7 +526,7 @@ func futureAppleSiliconDesktop(_ model: String) -> Bool {
 func requireSupportedLEDHost(smc existingSMC: SMC? = nil) throws {
     let model = modelID()
     if model == "Macmini8,1" {
-        throw ToolError("Intel Mac mini LED encoding is unverified; regular LED writes remain disabled")
+        throw ToolError("Intel Mac mini 2018 uses a separate white-only SMC LED interface; amber/color controls are unsupported")
     }
     let knownModel = supportedAppleSiliconDesktops.contains(model)
     let acknowledged = CommandLine.arguments.contains("--accept-untested-model")
@@ -536,6 +652,468 @@ func setKnownLEDBrightness(_ brightness: UInt8) throws {
     try applyKnownLED(smc, mode: .white, brightness: brightness)
 }
 
+// Manual white and steady-amber fades on Apple Silicon. This intentionally
+// keeps the installed solar scheduler's existing three-second timing intact.
+// --fade <level> preserves the active channel; ordinary white commands select
+// white, fading through darkness if switching from amber.
+func siliconFadeBrightness(_ target: UInt8, duration explicitDuration: TimeInterval? = nil,
+                           selectMode: LEDMode? = nil) throws {
+    if let explicitDuration {
+        guard explicitDuration.isFinite, (0.01...15.0).contains(explicitDuration) else {
+            throw ToolError("Fade duration must be between 0.01 and 15 seconds")
+        }
+    }
+    try requireRoot()
+    let smc = try SMC()
+    try requireSupportedLEDHost(smc: smc)
+    try checkLEDKeys(smc, includeModes: true)
+    let current = try smc.read("LSLN")
+    guard current.count == 2, current[0] == current[1] else {
+        throw ToolError("Apple Silicon LED brightness is not a symmetric ui16 value; refusing fade")
+    }
+    let activeChannel = try smc.read("LSCS")
+    guard activeChannel == [0] || activeChannel == [1] else {
+        throw ToolError("Apple Silicon LED is not on a recognized white/amber channel")
+    }
+    // A regular brightness command chooses white, but an explicit --fade
+    // without a mode preserves the current white/amber channel.
+    let desiredChannel: UInt8 = selectMode == .white ? 0 :
+                               selectMode == .amber ? 1 : activeChannel[0]
+    let start = current[0]
+    if desiredChannel == activeChannel[0] {
+        let duration = explicitDuration ??
+            proportionalFadeSeconds(from: Double(start), to: Double(target))
+        if start == target { return }
+        try fadeBrightness(smc, from: start, to: target, duration: duration,
+                           steps: fadeStepCount(for: duration))
+    } else {
+        // Channel switch: fade the old channel down, switch while dark, then
+        // fade the selected channel up. This is the proven auto-mode path.
+        let outDuration = explicitDuration.map { $0 / 2 } ??
+            proportionalFadeSeconds(from: Double(start), to: 0)
+        let inDuration = explicitDuration.map { $0 / 2 } ??
+            proportionalFadeSeconds(from: 0, to: Double(target))
+        if start > 0 {
+            try fadeBrightness(smc, from: start, to: 0, duration: outDuration,
+                               steps: fadeStepCount(for: outDuration))
+        } else {
+            try smc.write("LSLN", bytes: [0, 0])
+        }
+        if desiredChannel == 0 { try restoreWhiteChannel(smc) }
+        else { try smc.write("LSSB", bytes: [4, 0]) }
+        try smc.write("LSLN", bytes: [0, 0])
+        if target > 0 {
+            try fadeBrightness(smc, from: 0, to: target, duration: inDuration,
+                               steps: fadeStepCount(for: inDuration))
+        }
+    }
+    let final = try smc.read("LSLN")
+    guard final == [target, target],
+          try smc.read("LSCS") == [desiredChannel] else {
+        throw ToolError("Apple Silicon brightness fade did not reach the target channel/level")
+    }
+    print("LED brightness faded to \(target)/255" +
+          (selectMode.map { " in \($0.rawValue) mode" } ?? " (current channel)"))
+}
+
+func setManualWhiteBrightness(_ brightness: UInt8, noFade: Bool) throws {
+    if modelID() == "Macmini8,1" {
+        // Intel needs software fade (LSLB updates have no built-in easing).
+        try intelSetBrightness(brightness, noFade: noFade)
+    } else {
+        // Preserve the existing *native* Apple Silicon behavior. Its white
+        // channel can smooth a single LSLN write in hardware. Don't layer
+        // a second software fade on every ordinary command.
+        try setKnownLEDBrightness(brightness)
+    }
+}
+
+// An explicit --fade on Apple Silicon without a duration should also use a
+// single native SMC write, preserving the currently selected color channel.
+// A timed request is opt-in to smcled's software interpolation instead.
+func siliconNativeCurrentChannelBrightness(_ level: UInt8) throws {
+    try requireRoot()
+    let smc = try SMC()
+    try requireSupportedLEDHost(smc: smc)
+    try checkLEDKeys(smc, includeModes: true)
+    let channel = try smc.read("LSCS")
+    guard channel == [0] || channel == [1] else {
+        throw ToolError("Cannot set native brightness: unknown LED channel")
+    }
+    try smc.write("LSLN", bytes: [level, level])
+    guard try smc.read("LSLN") == [level, level] else {
+        throw ToolError("Native brightness write did not return expected LSLN")
+    }
+    print("Native LED brightness set to \(level)/255 (current channel).")
+}
+
+// Physically validated on one Macmini8,1 (T2, bridgeOS 24P6005):
+// LSOO=0 -> LED off, LSOF=01, LSPV=00 00.
+// LSOO=1 -> visibly full-bright white, LSPV=6B 08.
+// LSRB=0 -> fades to normal white, LSPV=14 11, LSOF=00.
+// This is an *independent* Intel protocol. No LSLN brightness values,
+// Apple Silicon amber presets, or boot-time installations are enabled here.
+// Conservative fingerprints restrict writes to the tested hardware state.
+enum IntelSILState {
+    case off, full, normal
+}
+
+func checkIntelSIL(_ smc: SMC) throws {
+    try requireRoot()
+    guard modelID() == "Macmini8,1" else {
+        throw ToolError("Intel SIL controls are restricted to Macmini8,1")
+    }
+    let required: [(String, UInt32, String, Bool, Bool)] = [
+        ("LSOO", 1, "flag", false, true),
+        ("LSRB", 1, "flag", false, true),
+        ("LSPV", 2, "ui16", true, false),
+        ("LSOF", 1, "flag", true, false),
+        ("LSLN", 2, "ui16", true, true),
+        ("LSLB", 2, "ui16", true, true),
+        ("LSSV", 2, "ui16", true, true),
+        ("LS! ", 1, "ui8 ", true, true)
+    ]
+    for (key, size, type, readable, writable) in required {
+        let info = try smc.info(key)
+        guard info.size == size && info.type == type &&
+              info.readable == readable && info.writable == writable else {
+            throw ToolError("Unexpected Intel SMC key metadata for \(key); refusing write")
+        }
+    }
+    // Exact state observed during physical tests. Fail closed on different
+    // T2 firmware/hardware until the variation is separately investigated.
+    guard try smc.read("LSLN") == [0x2F, 0xFF],
+          try smc.read("LSSV") == [0x08, 0x6B],
+          try smc.read("LS! ") == [0x00] else {
+        throw ToolError("Intel SIL calibration differs from the tested unit; refusing write")
+    }
+}
+
+// The Intel T2 SIL is a distinct controller path from Apple Silicon.
+// 0...255 is mapped to the 16-bit LSLB full-on PWM preset using [v,v].
+// Tests physically confirmed 08 00, 10 00, 20 00, 7F FF and FF FF,
+// including repeatable dimming and recovery. Arbitrary levels remain
+// experimental. Changes last until --reset, sleep/firmware reset or reboot;
+// no LaunchDaemon or persistent preference is installed.
+private let intelNormalPWM: [UInt8] = [0x14, 0x11]
+private let intelDefaultLSLB: [UInt8] = [0xFF, 0xFF]
+private let intelFullPWM: [UInt8] = [0x6B, 0x08]
+
+func intelUnsigned16(_ bytes: [UInt8]) -> Int {
+    Int(bytes[0]) * 256 + Int(bytes[1])
+}
+
+func intelPWMExpected(_ brightnessPreset: [UInt8]) -> Int {
+    // Observed proportional relationship: full LSLB=FFFF -> LSPV=6B08.
+    // Rounded integer approximation permits small fixed-point differences.
+    (intelUnsigned16(brightnessPreset) * 0x6B08 + 0x7FFF) / 0xFFFF
+}
+
+func intelManualOverrideActive(preset: [UInt8], pwm: [UInt8], off: [UInt8]) -> Bool {
+    // Under manual LSOO=1, live PWM follows the current LSLB calibration.
+    // Both initial brightness and the persistent override must be checked.
+    off == [0] && pwm != intelNormalPWM && pwm.count == 2 &&
+        abs(intelUnsigned16(pwm) - intelPWMExpected(preset)) <= 3
+}
+
+func intelStableState(_ smc: SMC) throws -> ([UInt8], [UInt8], [UInt8]) {
+    // Sample twice to avoid treating an active flash or fading transition as
+    // a steady state. This is a guard, not proof that no external writer exists.
+    let preset = try smc.read("LSLB")
+    guard preset.count == 2 else { throw ToolError("Intel LSLB size differs") }
+    let pwm = try smc.read("LSPV")
+    let off = try smc.read("LSOF")
+    Thread.sleep(forTimeInterval: 0.2)
+    let pwmAgain = try smc.read("LSPV")
+    let offAgain = try smc.read("LSOF")
+    guard pwm == pwmAgain, off == offAgain else {
+        throw ToolError("Intel LED output is changing (possibly fading or blinking); retry when stable")
+    }
+    let isOff = off == [1] && pwm == [0, 0]
+    let isNormal = off == [0] && pwm == intelNormalPWM
+    let isOverride = intelManualOverrideActive(preset: preset, pwm: pwm, off: off)
+    guard isOff || isNormal || isOverride else {
+        throw ToolError("Intel LED state not recognized (LSLB=\(hex(preset)), LSPV=\(hex(pwm)), LSOF=\(hex(off))); refusing write")
+    }
+    return (preset, pwm, off)
+}
+
+func intelWaitFor(_ smc: SMC, targetPWM: [UInt8], tolerance: Int = 0,
+                  targetOff: [UInt8], maxSeconds: TimeInterval) throws -> [UInt8] {
+    let deadline = Date().addingTimeInterval(maxSeconds)
+    var pwm: [UInt8] = []
+    var off: [UInt8] = []
+    repeat {
+        pwm = try smc.read("LSPV")
+        off = try smc.read("LSOF")
+        if off == targetOff, pwm.count == 2,
+           abs(intelUnsigned16(pwm) - intelUnsigned16(targetPWM)) <= tolerance { return pwm }
+        Thread.sleep(forTimeInterval: 0.2)
+    } while Date() < deadline
+    throw ToolError("Intel LED did not reach requested state within \(maxSeconds)s (LSPV=\(hex(pwm)), LSOF=\(hex(off)))")
+}
+
+func intelRestoreSystem(_ smc: SMC) throws {
+    // Restore the *mode* first; restoring LSLB while full-on override is
+    // active visibly pulses the LED at maximum brightness.
+    // Already at normal PWM? Don't restart a fade or cause a visible pulse.
+    // A custom full-on preset can be restored without changing output when
+    // firmware-controlled mode is already active.
+    let currentPWM = try smc.read("LSPV")
+    let currentOff = try smc.read("LSOF")
+    let currentPreset = try smc.read("LSLB")
+    // An active manual override can coincidentally have exactly the factory
+    // PWM (e.g. LSLB=2F FF). Checking LSPV alone cannot distinguish the
+    // override from native mode. Always clear the override before restoring
+    // an altered LSLB; otherwise LSLB=FF FF would flash full brightness.
+    if currentPWM != intelNormalPWM || currentOff != [0] ||
+       currentPreset != intelDefaultLSLB {
+        try smc.write("LSRB", bytes: [0])
+        _ = try intelWaitFor(smc, targetPWM: intelNormalPWM, targetOff: [0], maxSeconds: 6)
+    }
+    if currentPreset != intelDefaultLSLB {
+        try smc.write("LSLB", bytes: intelDefaultLSLB)
+        guard try smc.read("LSLB") == intelDefaultLSLB else {
+            throw ToolError("Intel LSLB factory preset restoration did not verify")
+        }
+    }
+    let pwm = try smc.read("LSPV")
+    let off = try smc.read("LSOF")
+    guard pwm == intelNormalPWM, off == [0] else {
+        throw ToolError("Intel normal PWM changed during restoration; inspect physical LED")
+    }
+}
+
+func intelWriteBrightness(_ level: UInt8) throws {
+    let smc = try SMC()
+    try checkIntelSIL(smc)
+    let (existingPreset, existingPWM, existingOff) = try intelStableState(smc)
+    if level == 0 {
+        // Off is a known separate firmware command, not a 16-bit PWM level.
+        // Preserve the current LSLB preset while off so that off->custom can
+        // set the next level without showing the factory brightness first.
+        if existingOff != [1] {
+            try smc.write("LSOO", bytes: [0])
+            _ = try intelWaitFor(smc, targetPWM: [0, 0], targetOff: [1], maxSeconds: 2)
+        }
+        print("Intel LED off (level 0). Run --reset for normal system brightness.")
+        return
+    }
+
+    let preset: [UInt8] = [level, level]
+    let alreadyOverridden = intelManualOverrideActive(
+        preset: existingPreset, pwm: existingPWM, off: existingOff)
+    // LSLB is the *active* PWM preset when LSOO=1. Earlier tests showed
+    // that changing it while overridden updates the LED immediately.
+    // Avoid calling LSRB + LSOO for custom->custom, which created a pulse
+    // to the normal firmware brightness (particularly obvious at levels 1–20).
+    // If the LED is off or normally controlled, update LSLB first, then
+    // engage LSOO=1 once. This avoids a factory-brightness flash from off.
+    if alreadyOverridden && existingPreset == preset {
+        print("Intel white brightness \(level)/255 already active: LSLB=\(hex(preset)), LSPV=\(hex(existingPWM)).")
+        return
+    }
+    do {
+        if existingPreset != preset {
+            try smc.write("LSLB", bytes: preset)
+            guard try smc.read("LSLB") == preset else {
+                throw ToolError("Intel LSLB write did not read back correctly")
+            }
+        }
+        if !alreadyOverridden {
+            try smc.write("LSOO", bytes: [1])
+        }
+
+        // Allow fixed-point round-off. The full 1...255 range is experimental:
+        // internal PWM values are not physical brightness measurements.
+        let expected = intelPWMExpected(preset)
+        let deadline = Date().addingTimeInterval(2)
+        var reached = false
+        var observed: [UInt8] = []
+        repeat {
+            observed = try smc.read("LSPV")
+            let off = try smc.read("LSOF")
+            if off == [0], observed.count == 2,
+               abs(intelUnsigned16(observed) - expected) <= 3 {
+                reached = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        } while Date() < deadline
+        guard reached else {
+            throw ToolError("Intel brightness level \(level) not verified (LSPV=\(hex(observed)), predicted PWM=\(expected))")
+        }
+        print("Intel white brightness \(level)/255: LSLB=\(hex(preset)), LSPV=\(hex(observed)).")
+        print("Experimental manual level; run --reset to restore normal firmware brightness.")
+    } catch {
+        writeStderr("WARNING: Intel level change failed; attempting normal-state restoration: \(error)\n")
+        // Return to verified system-controlled brightness if the active
+        // override or register write behaves unexpectedly.
+        do { try intelRestoreSystem(smc) }
+        catch { writeStderr("WARNING: automatic Intel recovery failed: \(error). Inspect the LED.\n") }
+        throw error
+    }
+}
+
+// Intel hardware responds immediately to LSLB changes. A fade therefore
+// needs multiple software-paced SMC writes, not one special firmware command.
+// Use the full 16-bit LSLB range for fine steps, particularly below 10/255.
+// This method is intentionally opt-in; immediate brightness stays immediate.
+// A full 0 -> 255 brightness change lasts 1 second; all other changes
+// take the corresponding fraction, on both Apple Silicon and Intel.
+func proportionalFadeSeconds(from start: Double, to end: Double) -> TimeInterval {
+    abs(end - start) / 255.0
+}
+
+func fadeStepCount(for duration: TimeInterval) -> Int {
+    // Never impose a minimum duration on short transitions. SMC transport
+    // overhead may still exceed the requested time for changes of 1-2 units.
+    max(1, min(180, Int((duration * 60.0).rounded())))
+}
+
+func intelFadePreset(from start: Int, to end: Int, step: Int, steps: Int) -> Int {
+    let t = Double(step) / Double(steps)
+    let eased = t * t * (3.0 - 2.0 * t)
+    return max(0, min(65535, Int((Double(start) + Double(end - start) * eased).rounded())))
+}
+
+func intelFadeBrightness(_ level: UInt8, duration explicitDuration: TimeInterval? = nil,
+                         smc existingSMC: SMC? = nil, automatic: Bool = false) throws {
+    if let explicitDuration {
+        guard explicitDuration.isFinite, (0.01...15.0).contains(explicitDuration) else {
+            throw ToolError("Fade duration must be between 0.01 and 15 seconds")
+        }
+    }
+    let smc = try existingSMC ?? SMC()
+    try checkIntelSIL(smc)
+    let (currentPreset, currentPWM, currentOff) = try intelStableState(smc)
+    let wasOff = currentOff == [1]
+    // The normal factory mode has LSPV=14 11. Its equivalent manual
+    // full-on preset is 2F FF, which also predicts LSPV=14 11 exactly.
+    // Use this to enter manual mode without a brightness jump.
+    let wasManual = currentOff == [0] &&
+                    currentPWM.count == 2 &&
+                    abs(intelUnsigned16(currentPWM) - intelPWMExpected(currentPreset)) <= 3 &&
+                    (currentPreset != intelDefaultLSLB || currentPWM != intelNormalPWM)
+    let start = wasOff ? 0 : (wasManual ? intelUnsigned16(currentPreset) : 0x2FFF)
+    let target = Int(level) * 257
+    let duration = explicitDuration ??
+        proportionalFadeSeconds(from: Double(start) / 257.0,
+                                to: Double(level))
+
+    if (wasOff && level == 0) || (wasManual && start == target) {
+        print("Intel fade: requested brightness already active.")
+        return
+    }
+
+    let cancellation = DiagnosticCancellation()
+    let steps = fadeStepCount(for: duration)
+    var activeOverride = wasManual
+    var lastPreset = currentPreset
+    let beginning = Date()
+    do {
+        if !wasOff && !wasManual {
+            // First acquire the manual override at the current factory PWM.
+            // Different from the old manual path that briefly changed level.
+            let matchingNormal: [UInt8] = [0x2F, 0xFF]
+            if lastPreset != matchingNormal {
+                try smc.write("LSLB", bytes: matchingNormal)
+                lastPreset = matchingNormal
+            }
+            try smc.write("LSOO", bytes: [1])
+            activeOverride = true
+        }
+
+        for i in 1...steps {
+            try cancellation.check()
+            let raw = intelFadePreset(from: start, to: target, step: i, steps: steps)
+            if level == 0 && i == steps {
+                // Preserve the confirmed zero/off semantics. An LSLB=0000
+                // override has never been tested and is not needed.
+                try smc.write("LSOO", bytes: [0])
+                activeOverride = false
+            } else if raw > 0 {
+                let next: [UInt8] = [UInt8((raw >> 8) & 0xFF), UInt8(raw & 0xFF)]
+                if lastPreset != next {
+                    try smc.write("LSLB", bytes: next)
+                    lastPreset = next
+                }
+                if !activeOverride {
+                    try smc.write("LSOO", bytes: [1])
+                    activeOverride = true
+                }
+            }
+            // Schedule against the initial time to avoid accumulating SMC
+            // transaction latency in a long series of small changes.
+            let deadline = beginning.addingTimeInterval(
+                duration * Double(i) / Double(steps))
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining > 0 { try cancellation.pause(remaining) }
+        }
+
+        if level == 0 {
+            _ = try intelWaitFor(smc, targetPWM: [0, 0], targetOff: [1],
+                                 maxSeconds: 2)
+        } else {
+            let expected = intelPWMExpected([level, level])
+            let actual = try intelWaitFor(smc, targetPWM: [UInt8(expected >> 8), UInt8(expected & 255)],
+                                          tolerance: 3, targetOff: [0],
+                                          maxSeconds: 2)
+            guard actual.count == 2,
+                  abs(intelUnsigned16(actual) - expected) <= 3,
+                  try smc.read("LSLB") == [level, level] else {
+                throw ToolError("Intel fade reached unexpected PWM \(hex(actual)); expected near \(expected)")
+            }
+        }
+        print("Intel white brightness faded to \(level)/255 over \(duration)s.")
+        if !automatic {
+            print("Manual mode remains active; use --reset for firmware-controlled white.")
+        }
+    } catch {
+        writeStderr("WARNING: Intel fade interrupted or failed: \(error). Attempting system restoration.\n")
+        do { try intelRestoreSystem(smc) }
+        catch { writeStderr("WARNING: Intel fade recovery failed: \(error). Inspect physical LED.\n") }
+        throw error
+    }
+}
+
+// Shared manual brightness entry: smooth relative-time fades by default,
+// while --no-fade keeps instant writes available when explicitly requested.
+func intelSetBrightness(_ level: UInt8, noFade: Bool = false) throws {
+    if noFade { try intelWriteBrightness(level) }
+    else { try intelFadeBrightness(level) }
+}
+
+func applyIntelSIL(_ state: IntelSILState, noFade: Bool = false) throws {
+    switch state {
+    case .full:
+        try intelSetBrightness(255, noFade: noFade)
+    case .off:
+        try intelSetBrightness(0, noFade: noFade)
+    case .normal:
+        let smc = try SMC()
+        try checkIntelSIL(smc)
+        let _ = try intelStableState(smc)
+        try intelRestoreSystem(smc)
+        print("Intel LED returned to normal system-controlled brightness (LSLB=FF FF, LSPV=14 11).")
+    }
+}
+
+func intelSILStatus() throws {
+    guard modelID() == "Macmini8,1" else {
+        throw ToolError("Intel SIL status is available on Macmini8,1 only")
+    }
+    let smc = try SMC()
+    print("Intel Mac mini 2018 SIL, read-only (actual hardware state must be checked visually):")
+    for key in ["LSLN", "LSLB", "LSLF", "LSPV", "LSSV", "LSOF", "LS! ", "LSB!"] {
+        let value = (try? smc.read(key)).map(hex) ?? "unavailable"
+        print("  \(key): \(value)")
+    }
+    print("Off, full-white, white blink patterns and selected dimming values verified on one Macmini8,1.")
+    print("Custom 0...255 levels and software fades are experimental; Intel amber/color is unsupported.")
+    print("White-only flash patterns have been physically observed on Macmini8,1.")
+}
+
 // Reject symlinks and unexpected ownership in privileged file destinations.
 // Refuse insecure pre-existing paths rather than following them as root.
 func validateManagedPath(_ path: String, directory: Bool) throws -> Bool {
@@ -609,11 +1187,171 @@ func validateCLIParents(create: Bool) throws -> Bool {
     return true
 }
 
+// The PATH entry is OPTIONAL. /usr/local/bin is often owned by a Homebrew
+// user on Intel Macs and is not a safe directory for a privileged executable
+// name: a non-root user could replace the symlink before "sudo smcled" runs.
+// Skip it rather than chown/chmod a directory managed by another program.
+// launchd always executes the root-owned installedExecutable by absolute path.
+func canManageCLILink() -> Bool {
+    (try? validateCLIParents(create: false)) == true
+}
+
 func installCLILink() throws {
     _ = try validateCLIParents(create: true)
     guard !(try validateCLILink()) else { return }
     try FileManager.default.createSymbolicLink(atPath: cliLink, withDestinationPath: installedExecutable)
     guard try validateCLILink() else { throw ToolError("Failed to create managed PATH symlink") }
+}
+
+// Per-user convenience link. Create it WITHOUT sudo: user-controlled
+// ~/.local/bin must never become a root-owned or trusted command directory.
+// The system LaunchDaemon continues to run installedExecutable absolutely.
+func userCLILinkPath() -> String {
+    NSHomeDirectory() + "/.local/bin/smcled"
+}
+
+func requireUnprivilegedUser() throws {
+    guard geteuid() != 0 else {
+        throw ToolError("Run this command WITHOUT sudo; ~/.local/bin is a per-user directory")
+    }
+}
+
+func ensurePrivateUserDirectory(_ path: String, create: Bool) throws -> Bool {
+    var attrs = stat()
+    if lstat(path, &attrs) == 0 {
+        guard (attrs.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
+              attrs.st_uid == geteuid() else {
+            throw ToolError("Refusing non-user-owned directory or symlink: \(path)")
+        }
+        return true
+    }
+    guard errno == ENOENT else {
+        throw ToolError("Cannot inspect user directory \(path): errno \(errno)")
+    }
+    guard create else { return false }
+    try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
+    return try ensurePrivateUserDirectory(path, create: false)
+}
+
+func installedUserCLILink() throws -> Bool {
+    let link = userCLILinkPath()
+    var attrs = stat()
+    if lstat(link, &attrs) != 0 {
+        if errno == ENOENT { return false }
+        throw ToolError("Cannot inspect user CLI link \(link): errno \(errno)")
+    }
+    guard (attrs.st_mode & mode_t(S_IFMT)) == mode_t(S_IFLNK),
+          attrs.st_uid == geteuid() else {
+        throw ToolError("Refusing unrelated or non-user-owned file at \(link)")
+    }
+    let target = try FileManager.default.destinationOfSymbolicLink(atPath: link)
+    guard target == installedExecutable else {
+        throw ToolError("Refusing unrelated symlink at \(link) -> \(target)")
+    }
+    return true
+}
+
+// Keep zsh's PATH usable without editing ~/.zprofile if it is already configured.
+// This function is intentionally called as the ordinary user, never under root.
+func ensureUserZshCLIPath() throws {
+    try requireUnprivilegedUser()
+    let probe = Process()
+    probe.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    probe.arguments = ["-lic", #"case ":$PATH:" in *":$HOME/.local/bin:"*) exit 0 ;; *) exit 1 ;; esac"#]
+    probe.standardOutput = FileHandle.nullDevice
+    probe.standardError = FileHandle.nullDevice
+    try probe.run()
+    probe.waitUntilExit()
+    if probe.terminationStatus == 0 { return }
+
+    let profile = NSHomeDirectory() + "/.zprofile"
+    let export = #"export PATH="$HOME/.local/bin:$PATH""#
+    var attrs = stat()
+    let exists = lstat(profile, &attrs) == 0
+    if exists {
+        guard (attrs.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              attrs.st_uid == geteuid() else {
+            throw ToolError("Refusing to edit unexpected or non-user-owned ~/.zprofile")
+        }
+    } else if errno != ENOENT {
+        throw ToolError("Cannot inspect ~/.zprofile: errno \(errno)")
+    }
+
+    let current = exists ? try String(contentsOfFile: profile, encoding: .utf8) : ""
+    guard !current.components(separatedBy: .newlines).contains(export) else { return }
+    if !exists && !FileManager.default.createFile(atPath: profile, contents: nil) {
+        throw ToolError("Could not create ~/.zprofile")
+    }
+    let output = try FileHandle(forWritingTo: URL(fileURLWithPath: profile))
+    defer { try? output.close() }
+    _ = try output.seekToEnd()
+    let separator = current.isEmpty || current.hasSuffix("\n") ? "" : "\n"
+    try output.write(contentsOf: Data((separator + "# smcled: add per-user command directory\n" + export + "\n").utf8))
+    print("Added ~/.local/bin to ~/.zprofile; open a new Terminal window to use smcled.")
+}
+
+func manageUserCLILink(remove: Bool = false) throws {
+    try requireUnprivilegedUser()
+    if !remove {
+        guard try validateManagedPath(installDirectory, directory: true),
+              try validateManagedPath(installedExecutable, directory: false) else {
+            throw ToolError("Install smcled first using sudo ./smcled --install-auto")
+        }
+    }
+    // Removal must work even after --uninstall deleted the protected binary.
+    let local = NSHomeDirectory() + "/.local"
+    let bin = local + "/bin"
+    _ = try ensurePrivateUserDirectory(local, create: !remove)
+    let binExists = try ensurePrivateUserDirectory(bin, create: !remove)
+    guard binExists else {
+        print("No per-user smcled link installed.")
+        return
+    }
+    let link = userCLILinkPath()
+    let present = try installedUserCLILink()
+    if remove {
+        if present {
+            try FileManager.default.removeItem(atPath: link)
+            print("Removed user CLI link: \(link)")
+        } else {
+            print("No per-user smcled link installed.")
+        }
+        return
+    }
+    if !present {
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: installedExecutable)
+    }
+    guard try installedUserCLILink() else {
+        throw ToolError("Could not verify the per-user smcled symlink")
+    }
+    print("User CLI link: \(link)")
+    try ensureUserZshCLIPath()
+    print("Use smcled --status or smcled --auto-preview without sudo.")
+    print("For privileged operations, use the protected absolute executable:")
+    print("  sudo \"\(installedExecutable)\" --auto-check")
+}
+
+// Only run home-directory setup as the original sudo caller. The daemon itself
+// always uses the root-owned executable; never trust the per-user PATH entry.
+@discardableResult
+func runUserCLISetup(remove: Bool = false) throws -> Bool {
+    guard let rawUID = ProcessInfo.processInfo.environment["SUDO_UID"],
+          let uid = uid_t(rawUID), uid != 0,
+          let entry = getpwuid(uid) else {
+        print("No sudo caller identified: per-user CLI setup skipped.")
+        return false
+    }
+    let username = String(cString: entry.pointee.pw_name)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+    process.arguments = ["-n", "-H", "-u", username, installedExecutable,
+                         remove ? "--uninstall-user-cli" : "--install-user-cli"]
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw ToolError("Per-user CLI setup failed for \(username) (exit \(process.terminationStatus))")
+    }
+    return true
 }
 
 func executableSource() throws -> String {
@@ -668,13 +1406,24 @@ func writeManagedFile(_ path: String, data: Data, executable: Bool = false) thro
 
 func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: Bool = false, interval: Int = 300) throws {
     try requireRoot()
-    try requireSupportedLEDHost()
+    let intel = modelID() == "Macmini8,1"
+    guard !intel || automatic else {
+        throw ToolError("Intel Mac mini supports --install-auto only; fixed-mode installation is disabled")
+    }
     // Validate solar-time source before modifying a previously working installation.
     if automatic { _ = try calculateAutoPlan(at: Date()) }
     // Check access and metadata before touching the installation.
     let smc = try SMC()
-    try requireSupportedLEDHost(smc: smc)
-    try checkLEDKeys(smc, includeModes: true)
+    if intel {
+        try checkIntelSIL(smc)
+        // A blinking/fading or unknown state could prevent the first auto
+        // transition. Refuse the installation before modifying any root-owned
+        // files, so the user can restore normal white and retry safely.
+        _ = try intelStableState(smc)
+    } else {
+        try requireSupportedLEDHost(smc: smc)
+        try checkLEDKeys(smc, includeModes: true)
+    }
 
     let fm = FileManager.default
     let exists = try validateManagedPath(installDirectory, directory: true)
@@ -687,39 +1436,77 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     let _ = try validateManagedPath(brightnessPreference, directory: false)
     let _ = try validateManagedPath(modePreference, directory: false)
     let _ = try validateManagedPath(daemonPlist, directory: false)
-    // Validate the PATH destination before stopping any existing service.
-    // If /usr/local or /usr/local/bin already exists, it must be root-owned
-    // and not writable by other users.
-    let _ = try validateCLIParents(create: false)
-    let _ = try validateCLILink()
-
-    // A reload is needed if the binary or plist changes.
-    if jobIsLoaded() {
-        _ = try callLaunchctl(["bootout", "system/" + jobLabel])
-    }
-
     let source = try executableSource()
-    if URL(fileURLWithPath: source).resolvingSymlinksInPath().path !=
-       URL(fileURLWithPath: installedExecutable).resolvingSymlinksInPath().path {
-        let binary = try Data(contentsOf: URL(fileURLWithPath: source))
-        try writeManagedFile(installedExecutable, data: binary, executable: true)
+    let replacingBinary = URL(fileURLWithPath: source).resolvingSymlinksInPath().path != installedExecutable
+    var replacements: [(String, Data)] = []
+    if replacingBinary {
+        replacements.append((installedExecutable, try Data(contentsOf: URL(fileURLWithPath: source))))
     }
-    try writeManagedFile(brightnessPreference, data: Data("\(brightness)\n".utf8))
-    try writeManagedFile(modePreference, data: Data("\(automatic ? "auto" : mode.rawValue)\n".utf8))
-    try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval, acknowledged: !physicallyTestedDesktops.contains(modelID())))
-    try installCLILink()
-    // A previously disabled service must be re-enabled explicitly.
-    _ = try callLaunchctl(["enable", "system/" + jobLabel])
-    _ = try callLaunchctl(["bootstrap", "system", daemonPlist])
+    let acknowledge = !intel && !physicallyTestedDesktops.contains(modelID())
+    replacements += [
+        (brightnessPreference, Data("\(brightness)\n".utf8)),
+        (modePreference, Data("\(automatic ? "auto" : mode.rawValue)\n".utf8)),
+        (daemonPlist, try createPlistData(automatic: automatic, interval: interval, acknowledged: acknowledge))
+    ]
+    let backups: [Data?] = try replacements.map { path, _ in
+        try validateManagedPath(path, directory: false) ? Data(contentsOf: URL(fileURLWithPath: path)) : nil
+    }
+    let wasLoaded = jobIsLoaded()
+    if wasLoaded { _ = try callLaunchctl(["bootout", "system/" + jobLabel]) }
+    var attempted = 0
+    do {
+        for (path, bytes) in replacements {
+            attempted += 1
+            try writeManagedFile(path, data: bytes, executable: path == installedExecutable)
+        }
+        _ = try callLaunchctl(["enable", "system/" + jobLabel])
+        _ = try callLaunchctl(["bootstrap", "system", daemonPlist])
+    } catch {
+        for i in (0..<attempted).reversed() {
+            let path = replacements[i].0
+            do {
+                if let bytes = backups[i] {
+                    try writeManagedFile(path, data: bytes, executable: path == installedExecutable)
+                } else if fm.fileExists(atPath: path) {
+                    try fm.removeItem(atPath: path)
+                }
+            } catch { writeStderr("Could not restore \(path): \(error)\n") }
+        }
+        if wasLoaded {
+            do { _ = try callLaunchctl(["bootstrap", "system", daemonPlist]) }
+            catch { writeStderr("Could not reload previous daemon: \(error)\n") }
+        }
+        if !exists, (try? fm.contentsOfDirectory(atPath: installDirectory).isEmpty) == true {
+            try? fm.removeItem(atPath: installDirectory)
+        }
+        throw error
+    }
+    var systemCLIInstalled = false
+    var userCLIInstalled = false
+    if canManageCLILink() {
+        do { try installCLILink(); systemCLIInstalled = true }
+        catch { writeStderr("System CLI unavailable: \(error)\n") }
+    }
+    if !systemCLIInstalled {
+        do { userCLIInstalled = try runUserCLISetup() }
+        catch { writeStderr("WARNING: LaunchDaemon installed, but user CLI setup failed: \(error)\n") }
+    }
 
     // RunAtLoad already starts the automatic fade. Do NOT duplicate that work
     // from this installer: two concurrent SMC fade loops would interfere.
     if !automatic { try applyKnownLED(smc, mode: mode, brightness: brightness) }
     print(automatic
-          ? "Installed \(jobLabel); automatic sunrise/sunset mode (every \(interval) seconds)."
+          ? "Installed \(jobLabel); \(intel ? "Intel white-only" : "white/amber") automatic sunrise/sunset mode (every \(interval) seconds)."
           : "Installed \(jobLabel); saved mode \(mode.rawValue), brightness \(brightness).")
     print("Boot-time job: \(daemonPlist)")
-    print("Shell command: \(cliLink) (sudo required to write)")
+    if systemCLIInstalled {
+        print("Shell command: \(cliLink)")
+    } else if userCLIInstalled {
+        print("Shell command: ~/.local/bin/smcled (open a new Terminal if PATH was updated)")
+    } else {
+        print("User CLI not installed; run ./smcled --install-user-cli without sudo.")
+    }
+    print("For sudo commands, prefer: sudo \"\(installedExecutable)\" <command>")
 }
 
 func readInstalledBrightness() throws -> UInt8 {
@@ -773,9 +1560,16 @@ func applyInstalledBrightness() throws {
     for attempt in 1...15 {
         do {
             let smc = try SMC()
-            try requireSupportedLEDHost(smc: smc)
-            if modeName == "auto" { try applyAutomaticLED(smc) }
-            else { try applyKnownLED(smc, mode: LEDMode(rawValue: modeName)!, brightness: brightness) }
+            if modelID() == "Macmini8,1" {
+                guard modeName == "auto" else {
+                    throw ToolError("Intel installed mode must be auto (white-only); fixed modes are unsupported")
+                }
+                try applyIntelAutomaticLED(smc)
+            } else {
+                try requireSupportedLEDHost(smc: smc)
+                if modeName == "auto" { try applyAutomaticLED(smc) }
+                else { try applyKnownLED(smc, mode: LEDMode(rawValue: modeName)!, brightness: brightness) }
+            }
             return
         } catch {
             lastError = error
@@ -802,23 +1596,39 @@ func uninstallBrightness() throws {
         }
     }
     let _ = try validateManagedPath(daemonPlist, directory: false)
-    let hasCLILink = try validateCLILink()
-    if hasCLILink { _ = try validateCLIParents(create: false) }
+    // Do not inspect or mutate user-owned PATH directories during uninstall.
+    let manageCLILink = canManageCLILink()
+    let hasCLILink = manageCLILink && ( (try? validateCLILink()) == true )
 
     if jobIsLoaded() {
         _ = try callLaunchctl(["bootout", "system/" + jobLabel])
     }
     // Restore the factory brightness where possible before deleting files.
     do {
-        try setKnownLEDBrightness(255)
-        print("Restored normal LED brightness (255).")
+        if modelID() == "Macmini8,1" {
+            try applyIntelSIL(.normal)
+            print("Restored Intel system-controlled white LED.")
+        } else {
+            try setKnownLEDBrightness(255)
+            print("Restored normal LED brightness (255).")
+        }
     } catch {
         writeStderr("WARNING: Could not restore LED brightness: \(error)\n")
+    }
+    // Remove only the original sudo caller's managed user link. Keep the
+    // user's PATH configuration because other applications may use it.
+    if hasDirectory && fm.fileExists(atPath: installedExecutable) {
+        do { _ = try runUserCLISetup(remove: true) }
+        catch { writeStderr("WARNING: Could not remove user CLI link: \(error)\n") }
     }
     if hasCLILink { try fm.removeItem(atPath: cliLink) }
     if fm.fileExists(atPath: daemonPlist) { try fm.removeItem(atPath: daemonPlist) }
     if hasDirectory { try fm.removeItem(atPath: installDirectory) }
-    print("Uninstalled \(jobLabel), preferences, executable, and managed PATH link.")
+    print("Uninstalled \(jobLabel), preferences and executable" +
+          (hasCLILink ? ", and managed PATH link." : "."))
+    if !manageCLILink {
+        print("Skipped untrusted PATH directory \(cliBinDirectory); no files were changed there.")
+    }
 }
 
 func installationStatus() throws {
@@ -828,11 +1638,27 @@ func installationStatus() throws {
     let plist = try validateManagedPath(daemonPlist, directory: false)
     print("Install: \(dir && binary && config && plist ? "complete" : "incomplete / not installed")")
     print("launchd loaded: \(jobIsLoaded() ? "yes" : "no")")
-    print("CLI PATH link: \((try validateCLILink()) ? cliLink : "not installed")")
+    if geteuid() != 0 {
+        let homeLocal = NSHomeDirectory() + "/.local"
+        let homeBin = homeLocal + "/bin"
+        if (try? ensurePrivateUserDirectory(homeLocal, create: false)) == true &&
+           (try? ensurePrivateUserDirectory(homeBin, create: false)) == true {
+            print("User CLI link: \((try? installedUserCLILink()) == true ? userCLILinkPath() : "not installed")")
+        } else {
+            print("User CLI link: not installed")
+        }
+    }
+    if canManageCLILink() {
+        print("CLI PATH link: \((try? validateCLILink()) == true ? cliLink : "not installed")")
+    } else {
+        print("CLI PATH link: skipped (missing or non-root-owned \(cliBinDirectory))")
+        if binary { print("Installed CLI: \(installedExecutable)") }
+    }
     if config {
         let installedMode = try readInstalledModeName()
         print("Configured mode: \(installedMode)")
         if installedMode == "auto" {
+            if modelID() == "Macmini8,1" { print("Auto color profile: white only (Intel Macmini8,1)") }
             if plist {
                 let data = try Data(contentsOf: URL(fileURLWithPath: daemonPlist))
                 let properties = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
@@ -1604,6 +2430,49 @@ struct AutomaticPlan {
     let next: LEDTransition?
 }
 
+// Distinct solar schedules: Intel 2018 has a white-only seven-stage brightness
+// progression. Apple Silicon retains the original six white/amber transitions.
+func automaticTransitions(for day: SolarDay, calendar: Calendar, model: String) -> [LEDTransition] {
+    let sunsetHour = calendar.component(.hour, from: day.sunset)
+    let late = sunsetHour >= 21
+    let finalOffset: TimeInterval = late ? 10_800 : 14_400
+    let finalDescription = late ? "Sunset + 3h (late sunset)" : "Sunset + 4h"
+    if model == "Macmini8,1" {
+        return [
+            LEDTransition(date: day.sunrise.addingTimeInterval(-3600), mode: .white,
+                          brightness: 33, description: "Sunrise - 1h"),
+            LEDTransition(date: day.sunrise, mode: .white,
+                          brightness: 50, description: "Sunrise"),
+            LEDTransition(date: day.sunrise.addingTimeInterval(3600), mode: .white,
+                          brightness: 100, description: "Sunrise + 1h"),
+            LEDTransition(date: day.sunrise.addingTimeInterval(7200), mode: .white,
+                          brightness: 255, description: "Sunrise + 2h"),
+            LEDTransition(date: day.sunset, mode: .white,
+                          brightness: 100, description: "Sunset"),
+            LEDTransition(date: day.sunset.addingTimeInterval(3600), mode: .white,
+                          brightness: 50, description: "Sunset + 1h"),
+            LEDTransition(date: day.sunset.addingTimeInterval(finalOffset), mode: .white,
+                          brightness: 33, description: finalDescription)
+        ]
+    }
+    // Original Apple Silicon behavior: DO NOT change these event times,
+    // brightness values, mode choices, or late-sunset handling.
+    return [
+        LEDTransition(date: day.sunrise.addingTimeInterval(-3600), mode: .amber,
+                      brightness: 100, description: "Sunrise - 1h"),
+        LEDTransition(date: day.sunrise, mode: .white,
+                      brightness: 33, description: "Sunrise"),
+        LEDTransition(date: day.sunrise.addingTimeInterval(3600), mode: .white,
+                      brightness: 255, description: "Sunrise + 1h"),
+        LEDTransition(date: day.sunset, mode: .white,
+                      brightness: 100, description: "Sunset"),
+        LEDTransition(date: day.sunset.addingTimeInterval(3600), mode: .amber,
+                      brightness: 255, description: "Sunset + 1h"),
+        LEDTransition(date: day.sunset.addingTimeInterval(finalOffset), mode: .amber,
+                      brightness: 33, description: finalDescription)
+    ]
+}
+
 func calculateAutoPlan(at now: Date, location explicit: SolarLocation? = nil) throws -> AutomaticPlan {
     let source: String
     let zone: TimeZone
@@ -1628,25 +2497,10 @@ func calculateAutoPlan(at now: Date, location explicit: SolarLocation? = nil) th
         days = fallback.2
     }
     let calendar = configuredCalendar(zone)
+    let model = modelID()
     var events: [LEDTransition] = []
     for day in days {
-        let sunsetHour = calendar.component(.hour, from: day.sunset)
-        let late = sunsetHour >= 21
-        events += [
-            LEDTransition(date: day.sunrise.addingTimeInterval(-3600), mode: .amber,
-                          brightness: 100, description: "Sunrise - 1h"),
-            LEDTransition(date: day.sunrise, mode: .white,
-                          brightness: 33, description: "Sunrise"),
-            LEDTransition(date: day.sunrise.addingTimeInterval(3600), mode: .white,
-                          brightness: 255, description: "Sunrise + 1h"),
-            LEDTransition(date: day.sunset, mode: .white,
-                          brightness: 100, description: "Sunset"),
-            LEDTransition(date: day.sunset.addingTimeInterval(3600), mode: .amber,
-                          brightness: 255, description: "Sunset + 1h"),
-            LEDTransition(date: day.sunset.addingTimeInterval(late ? 10800 : 14400),
-                          mode: .amber, brightness: 33,
-                          description: late ? "Sunset + 3h (late sunset)" : "Sunset + 4h")
-        ]
+        events.append(contentsOf: automaticTransitions(for: day, calendar: calendar, model: model))
     }
     events.sort { $0.date < $1.date }
     guard let active = events.last(where: { $0.date <= now }) else {
@@ -1671,6 +2525,10 @@ func previewAutomaticLED(location: SolarLocation? = nil) throws {
     let cal = configuredCalendar(plan.zone)
     let today = cal.startOfDay(for: now)
     print("Solar source: \(plan.source)")
+    let model = modelID()
+    if model == "Macmini8,1" {
+        print("Automatic LED profile: Intel 2018 white-only (seven brightness transitions)")
+    }
     print("Current time: \(f.string(from: now))")
     for day in plan.days where cal.isDate(day.sunrise, inSameDayAs: today) {
         print("Sunrise: \(f.string(from: day.sunrise))")
@@ -1710,8 +2568,25 @@ func fadeBrightness(_ smc: SMC, from start: UInt8, to end: UInt8,
     }
 }
 
+// Reuse the same six solar transitions, but use Intel's proportional 16-bit
+// LSLB software fade and NEVER send an amber/channel-select command.
+func applyIntelAutomaticLED(_ smc: SMC) throws {
+    try checkIntelSIL(smc)
+    let plan = try calculateAutoPlan(at: Date())
+    let target = plan.target.brightness
+    guard plan.events.allSatisfy({ $0.mode == .white }) else {
+        throw ToolError("Intel automatic profile contains a non-white event; refusing SMC writes")
+    }
+    try intelFadeBrightness(target, smc: smc, automatic: true)
+    print("Intel white-only auto: \(plan.target.description) -> white \(target)/255")
+}
+
 func applyAutomaticLED(_ smc: SMC) throws {
     try requireRoot()
+    if modelID() == "Macmini8,1" {
+        try applyIntelAutomaticLED(smc)
+        return
+    }
     try requireSupportedLEDHost(smc: smc)
     try checkLEDKeys(smc, includeModes: true)
     let target = try calculateAutoPlan(at: Date()).target
@@ -1780,71 +2655,105 @@ func testZeroBrightness() throws {
 }
 
 func usage() {
-    print("""
-    smcled — AppleSMC status LED CLI for Mac mini and Mac Studio
+    // Do not manually align text inside a multiline literal: long commands
+    // collide with the description column, and terminal fonts/windows vary.
+    // Keep a fixed command column and wrap descriptions to 80 characters.
+    let columnWidth = 36
+    let maxLineWidth = 80
 
-      sudo smcled 10                      White at brightness 10
-      sudo smcled --white [0...255]      White; optional brightness (current if omitted)
-      sudo smcled --amber [0...255]      Steady amber; optional brightness
-      sudo smcled --amber-blink [0...255]
-                                          Single amber flashing
-      sudo smcled --amber-double [0...255]
-                                          Double amber flashing
-      sudo smcled --off                  Turn LED off (white brightness 0)
-      sudo smcled --reset                Default white brightness (255)
+    func section(_ heading: String) {
+        print("\n\(heading)")
+    }
 
-      sudo smcled --install 10           Persist white brightness 10
-      sudo smcled --install white 10     Persist white brightness 10
-      sudo smcled --install amber 10     Persist steady amber brightness 10
-      sudo smcled --install amber-blink 50
-                                          Persist single flashing amber at 50
-      sudo smcled --install amber-double 50
-                                          Persist double flashing amber at 50
-      sudo smcled --install-auto [seconds]
-                                          Sunrise/sunset checks; 300s default (30...86400)
-      smcled --auto-preview               Show today's solar events & LED plan
-      smcled --auto-preview <lat> <lon> <IANA-timezone>
-                                          Preview with explicit coordinates
-      sudo smcled --auto-check            Apply appropriate state right now
-      sudo smcled --test-zero             Reversible white/amber 0 test
-      smcled --status                    Read configured settings; no sudo
-      sudo smcled --uninstall            Remove daemon, files, symlink; reset LED
+    func option(_ command: String, _ description: String) {
+        let shortCommand = command.count <= columnWidth - 2
+        let commandLine = "  " + command
+        if !shortCommand { print(commandLine) }
+        let prefix: String = shortCommand
+            ? commandLine + String(repeating: " ", count: columnWidth - command.count)
+            : String(repeating: " ", count: columnWidth + 2)
+        let continuation = String(repeating: " ", count: prefix.count)
+        var line = prefix
+        for word in description.split(separator: " ") {
+            let value = String(word)
+            let separator = line == prefix ? "" : " "
+            if line != prefix && line.count + separator.count + value.count > maxLineWidth {
+                print(line)
+                line = continuation + value
+            } else {
+                line += separator + value
+            }
+        }
+        print(line)
+    }
 
-      smcled --compatibility             Read-only hardware capability report
-      smcled --sample-brightness         Read LSLN repeatedly, without writes
-      smcled --intel-snapshot              Read-only Intel SMC LED key inventory
-      sudo smcled --intel-suite --confirm-hardware-test
-                                          Three reversible Intel LSLN tests
-      sudo smcled --intel-probe first 32 --confirm-hardware-test
-      sudo smcled --intel-probe second 100 --confirm-hardware-test
-                                          Select byte and value without recompiling
-      sudo smcled --test-intel-brightness 100 --confirm-hardware-test
-                                          Legacy second-byte test on Macmini8,1
-      --accept-untested-model             Enable a matching but untested Apple Silicon
-                                          mini/Studio (including future models)
-      smcled --compatibility-self-test   Offline signature classification tests
-      sudo smcled --test-brightness 100 --confirm-hardware-test
-                                          Reversible LSLN probe on candidate models
-      sudo smcled --test-studio-amber --confirm-hardware-test
-                                          Reversible steady amber probe on Mac16,9
-      smcled model                       Print hardware identifier
-      smcled read <FOURCC>               Read an SMC key
-      smcled info <FOURCC>               Read key metadata
-      smcled scan [--all]                Enumerate keys (read only)
-      sudo smcled --test-amber-brightness 10
-                                          Temporary brightness/amber experiment
-      sudo smcled --test-amber [4|8|9]   3-second reversible preset test
-      sudo smcled --test-dual-channel     Sample white/amber PWM during switching
-      sudo smcled led <KEY> <0...255> --confirm-led-key [--mode vv|v0]
-      sudo smcled test <KEY> --confirm-led-key [--mode vv|v0]
+    print("smcled — AppleSMC status LED CLI for Mac mini and Mac Studio")
 
-    Brightness: integer 0...255. Without a value, amber commands retain
-    the current LSLN brightness; --install <mode> without a value retains
-    the saved brightness (or defaults to 255 on a new installation).
-    Immediate changes do not modify the saved boot preference.
-    Steady amber dimming confirmed on hardware; flashing dimming not yet tested.
-    """)
+    section("BRIGHTNESS AND COLOR")
+    option("sudo smcled 10", "Set white brightness 0...255. Intel fades by default; Apple Silicon uses native behavior.")
+    option("sudo smcled 10 --no-fade", "Intel: change brightness immediately, without the software fade.")
+    option("sudo smcled --white [0...255]", "White LED; on Intel, omit the number to restore system control.")
+    option("sudo smcled --off", "Turn the LED off.")
+    option("sudo smcled --reset", "Restore white: native Intel system control or Apple Silicon brightness 255.")
+    option("sudo smcled --fade 50 [seconds]", "Intel: proportional fade (full 0...255 range takes 1s); Apple Silicon: native write unless seconds specified.")
+    option("sudo smcled --amber [0...255]", "Apple Silicon only: steady amber; retain brightness if omitted.")
+    option("sudo smcled --amber-blink [0...255]", "Apple Silicon only: single amber flashes.")
+    option("sudo smcled --amber-double [0...255]", "Apple Silicon only: double amber flashes.")
+
+    section("INTEL MAC MINI 2018 (WHITE LED ONLY)")
+    option("sudo smcled --intel-brightness 50", "Set white brightness 0...255, using proportional software fade.")
+    option("sudo smcled --intel-full", "Set full white brightness.")
+    option("sudo smcled --intel-restore", "Restore firmware-controlled white brightness.")
+    option("smcled --intel-led-status", "Read current Intel LED registers.")
+    print("  Amber and fixed-mode installation are not available on Macmini8,1.")
+
+    section("AUTOMATIC MODE AND INSTALLATION")
+    option("smcled --auto-preview", "Preview the solar schedule without modifying the LED.")
+    option("smcled --auto-preview <lat> <lon> <tz>", "Preview using explicit coordinates and an IANA time zone.")
+    option("sudo smcled --auto-check", "Apply the current solar target once; no installation.")
+    option("sudo smcled --install-auto [seconds]", "Install a periodic LaunchDaemon; 300s default, 30...86400s allowed. Intel: 7 white-only events; Apple Silicon: 6 white/amber events.")
+    option("smcled --status", "Show saved preferences, daemon state, interval and optional PATH link.")
+    option("smcled --install-user-cli", "Without sudo: create ~/.local/bin/smcled and configure zsh PATH if needed.")
+    option("smcled --uninstall-user-cli", "Without sudo: remove only your ~/.local/bin/smcled shortcut.")
+    option("sudo smcled --uninstall", "Stop the daemon, remove managed files and restore LED control.")
+    option("sudo smcled --install 10", "Apple Silicon only: persist white brightness.")
+    option("sudo smcled --install white 10", "Apple Silicon only: persist white brightness.")
+    option("sudo smcled --install amber 10", "Apple Silicon only: persist steady amber.")
+    option("sudo smcled --install amber-blink 50", "Apple Silicon only: persist single amber flashing.")
+    option("sudo smcled --install amber-double 50", "Apple Silicon only: persist double amber flashing.")
+    print("  On Intel, only --install-auto is supported; fixed modes are blocked.")
+    print("  CLI path: /usr/local/bin when available, otherwise ~/.local/bin.")
+    print("  Daemon executable: /Library/Application Support/smcled/smcled.")
+
+    section("COMPATIBILITY AND READ-ONLY TOOLS")
+    option("smcled --compatibility", "Show recognized LED SMC key profile and model support.")
+    option("smcled --compatibility-self-test", "Run hardware-independent model, fade and schedule tests.")
+    option("smcled model", "Print the Mac model identifier.")
+    option("smcled --sample-brightness", "Read LSLN repeatedly, without writes.")
+    option("smcled --intel-snapshot", "Read-only Intel SMC LED key inventory.")
+    option("smcled read <FOURCC>", "Read a single SMC key.")
+    option("smcled info <FOURCC>", "Display SMC key metadata.")
+    option("smcled scan [--all]", "Enumerate SMC keys without writing.")
+    option("--accept-untested-model", "Explicit opt-in for matching but untested Apple Silicon Mac mini/Studio models.")
+
+    section("HARDWARE EXPERIMENTS (SUDO; USE WITH CARE)")
+    option("sudo smcled --test-zero", "Reversible Apple Silicon zero-brightness test.")
+    option("sudo smcled --test-brightness 100 --confirm-hardware-test", "Reversible brightness test on candidate models.")
+    option("sudo smcled --test-studio-amber --confirm-hardware-test", "Reversible Mac16,9 amber test.")
+    option("sudo smcled --test-amber-brightness 10", "Reversible Apple Silicon steady-amber brightness test.")
+    option("sudo smcled --test-amber [4|8|9]", "Reversible Apple Silicon amber preset test.")
+    option("sudo smcled --test-dual-channel", "Sample Apple Silicon white/amber PWM during switching.")
+    option("sudo smcled --intel-suite --confirm-hardware-test", "Legacy three-stage Intel LSLN research test.")
+    option("sudo smcled --intel-probe first 32 --confirm-hardware-test", "Legacy Intel first-byte LSLN probe.")
+    option("sudo smcled --intel-probe second 100 --confirm-hardware-test", "Legacy Intel second-byte LSLN probe.")
+    option("sudo smcled --test-intel-brightness 100 --confirm-hardware-test", "Legacy Intel second-byte brightness probe.")
+    option("sudo smcled led <KEY> <0...255> --confirm-led-key [--mode vv|v0]", "Restricted direct LED key write.")
+    option("sudo smcled test <KEY> --confirm-led-key [--mode vv|v0]", "Restricted reversible LED key test.")
+
+    print("\nBrightness range: 0...255. Manual changes never modify saved preferences.")
+    print("Automatic solar checks run at startup and at the configured interval.")
 }
+
 func verifyLED(_ smc: SMC, key: String, args: [String]) throws -> String {
     guard modelID() == "Macmini9,1" else {
         throw ToolError("LED writes restricted to Macmini9,1; detected \(modelID())")
@@ -1878,14 +2787,83 @@ func ledBytes(_ value: UInt8, mode: String) -> [UInt8] {
 }
 
 func run(_ originalArguments: [String]) throws {
-    let arguments = originalArguments.filter { $0 != "--accept-untested-model" }
+    let noFade = originalArguments.contains("--no-fade")
+    let arguments = originalArguments.filter {
+        $0 != "--accept-untested-model" && $0 != "--no-fade"
+    }
     guard let command = arguments.first else { usage(); return }
+    if noFade {
+        let isNumeric = !command.isEmpty && command.allSatisfy({ $0 >= "0" && $0 <= "9" })
+        let valid = isNumeric || command == "--intel-brightness" ||
+                    command == "--intel-full" || command == "--intel-off" ||
+                    command == "--off" || command == "--reset" ||
+                    (command == "--white" && arguments.count == 2) ||
+                    (command == "--amber" && arguments.count == 2)
+        guard valid else {
+            throw ToolError("--no-fade is only valid for manual brightness changes, not --fade or installation")
+        }
+    }
     if ["--help", "help", "-h"].contains(command) { usage(); return }
     if command == "model" { print(modelID()); return }
+    #if os(macOS)
+    let readOnly = ["--compatibility", "--compatibility-self-test", "--intel-led-status",
+                    "--intel-snapshot", "--sample-brightness", "--auto-preview", "--status",
+                    "info", "read", "scan", "--install-user-cli", "--uninstall-user-cli"]
+    var lockFD: Int32 = -1
+    if geteuid() == 0 && !readOnly.contains(command) {
+        // Hold through final readback and recovery. launchd children take their own lock.
+        lockFD = open("/private/var/run/smcled.lock", O_RDWR | O_CREAT | O_EXLOCK | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard lockFD >= 0 else { throw ToolError("Cannot lock LED controller: errno \(errno)") }
+    }
+    defer { if lockFD >= 0 { close(lockFD) } }
+    #endif
     switch command {
     case "--compatibility":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility") }
         try reportCompatibility()
+        return
+    case "--intel-led-status":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-led-status") }
+        try intelSILStatus()
+        return
+    case "--fade":
+        guard arguments.count == 2 || arguments.count == 3 else {
+            throw ToolError("Usage: sudo smcled --fade <0...255> [seconds]")
+        }
+        let level = try brightnessNumber(arguments[1])
+        let duration: Double?
+        if arguments.count == 3 {
+            guard let value = Double(arguments[2]), value.isFinite,
+                  (0.01...15.0).contains(value) else {
+                throw ToolError("Fade duration must be between 0.01 and 15 seconds")
+            }
+            duration = value
+        } else {
+            duration = nil
+        }
+        if modelID() == "Macmini8,1" {
+            try intelFadeBrightness(level, duration: duration)
+        } else if let duration {
+            // Explicit duration is an explicit request for software easing.
+            try siliconFadeBrightness(level, duration: duration)
+        } else {
+            // Default is Apple's native one-write LED behavior, not an
+            // additional software fade layered over firmware smoothing.
+            try siliconNativeCurrentChannelBrightness(level)
+        }
+        return
+    case "--intel-brightness":
+        guard arguments.count == 2 else { throw ToolError("Usage: sudo smcled --intel-brightness <0...255>") }
+        guard modelID() == "Macmini8,1" else {
+            throw ToolError("--intel-brightness is only supported on Macmini8,1")
+        }
+        try intelSetBrightness(brightnessNumber(arguments[1]), noFade: noFade)
+        return
+    case "--intel-full", "--intel-restore", "--intel-off":
+        guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled \(command)") }
+        try applyIntelSIL(command == "--intel-full" ? .full :
+                          command == "--intel-restore" ? .normal : .off,
+                          noFade: noFade)
         return
     case "--intel-snapshot":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-snapshot") }
@@ -1952,7 +2930,6 @@ func run(_ originalArguments: [String]) throws {
     case "--auto-check":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --auto-check") }
         try requireRoot()
-        try requireSupportedLEDHost()
         try applyAutomaticLED(SMC())
         return
     case "--install-auto":
@@ -1988,27 +2965,47 @@ func run(_ originalArguments: [String]) throws {
         return
     case "--off":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --off") }
-        try setKnownLEDBrightness(0)
+        try setManualWhiteBrightness(0, noFade: noFade)
         print("LED off; boot preference unchanged.")
         return
     case "--reset":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --reset") }
-        try setKnownLEDBrightness(255)
+        if modelID() == "Macmini8,1" {
+            // --reset restores firmware-controlled brightness, not an 8-bit
+            // manual level. Its firmware transition already fades.
+            try applyIntelSIL(.normal)
+            return
+        }
+        try setManualWhiteBrightness(255, noFade: noFade)
         print("Restored normal white LED brightness (255); boot preference unchanged.")
         return
     case "--white":
         guard arguments.count == 1 || arguments.count == 2 else { throw ToolError("Usage: sudo smcled --white [0...255]") }
-        let brightness = try arguments.count == 2 ? brightnessNumber(arguments[1]) : nil
+        if arguments.count == 2 {
+            try setManualWhiteBrightness(brightnessNumber(arguments[1]), noFade: noFade)
+            print("White brightness set; boot preference unchanged.")
+            return
+        }
+        if modelID() == "Macmini8,1" {
+            try applyIntelSIL(.normal)
+            return
+        }
+        let brightness: UInt8? = nil
         let smc = try SMC()
         try applyKnownLED(smc, mode: .white, brightness: brightness)
         print("Normal white LED restored\(brightness.map { " at brightness \($0)" } ?? ""); boot preference unchanged.")
         return
     case "--amber", "--amber-blink", "--amber-double":
+        if modelID() == "Macmini8,1" {
+            throw ToolError("Macmini8,1 LED control is white-only; amber is not supported. Use --fade, a white brightness command, or --reset.")
+        }
         guard arguments.count == 1 || arguments.count == 2 else {
             throw ToolError("Usage: sudo smcled \(command) [0...255]")
         }
         let brightness = try arguments.count == 2 ? brightnessNumber(arguments[1]) : nil
         let mode: LEDMode = command == "--amber" ? .amber : (command == "--amber-blink" ? .amberBlink : .amberDouble)
+        // Preserve Apple Silicon's verified native amber/white behavior.
+        // No new fade loop for standard manual color commands.
         let smc = try SMC()
         try applyKnownLED(smc, mode: mode, brightness: brightness)
         print("Applied \(mode.rawValue) LED behavior\(brightness.map { " at brightness \($0)" } ?? ""); boot preference unchanged.")
@@ -2033,6 +3030,14 @@ func run(_ originalArguments: [String]) throws {
         }
         try testAmberChannel(mode: mode)
         return
+    case "--install-user-cli":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --install-user-cli (without sudo)") }
+        try manageUserCLILink()
+        return
+    case "--uninstall-user-cli":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --uninstall-user-cli (without sudo)") }
+        try manageUserCLILink(remove: true)
+        return
     case "--status":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --status") }
         try installationStatus()
@@ -2044,13 +3049,14 @@ func run(_ originalArguments: [String]) throws {
     default: break
     }
 
-    // A bare number is an immediate, non-persistent brightness change.
+    // Bare brightness uses the Intel proportional software fade; Apple
+    // Silicon retains its original native single-write behavior.
     // --install is the explicit way to change the saved boot preference.
     if command.allSatisfy({ $0 >= "0" && $0 <= "9" }) {
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled <0...255>") }
         let brightness = try brightnessNumber(command)
-        try setKnownLEDBrightness(brightness)
-        print("LED brightness set to \(brightness) (\(hex([brightness, brightness]))). Saved boot preference, if installed, was not changed.")
+        try setManualWhiteBrightness(brightness, noFade: noFade)
+        print("LED brightness set to \(brightness). Saved boot preference, if installed, was not changed.")
         return
     }
 

@@ -747,3 +747,81 @@ Important: `LSPV` differs from `LSLB` and `LSLN` but **this is not conclusive ab
 **Next controlled experiment:** observe read-only `LSPV` at approximately 100–200 ms intervals *during* the already-tested reversible `LSLN` suite. Correlation (or its absence) will establish whether `LSLN` changes propagate into the reported live PWM. Do not write `LSLB`, `LSOO`, `LSSV`, `LSSE`, `LSSB`, or `LSUP` until supported by further independent evidence. Changing `LSLN` was already completed without visible effect on this particular machine, but no user test is risk-free.
 
 Independent reference: https://github.com/floe/smc_util/blob/master/docs/readme.md (historic SIL key semantics, not guaranteed for T2).
+
+
+## 18 November 2026 — Physically verified Intel T2 LED control (supersedes older Intel hypotheses)
+
+Hardware: 2018 Intel Mac mini `Macmini8,1`, J174, macOS 15.8.2, T2 bridgeOS 24P6005.
+
+The user's tests conclusively showed that the Intel mini's front LED is software controllable through a **different SMC path** from Apple Silicon:
+
+| Operation | SMC registers | Observed physical LED and output |
+|---|---|---|
+| Factory mode | `LSRB=00` | Normal white, `LSPV=14 11`, `LSOF=00`; restoration may fade |
+| Force off | `LSOO=00` | White LED goes out, `LSPV=00 00`, `LSOF=01` |
+| Force full-white | `LSOO=01`, original `LSLB=FF FF` | Very bright white, `LSPV=6B 08` |
+| Intermediate brightness | Set `LSLB`, then `LSOO=01` | `LSLB=08 00 → LSPV=03 58`; `10 00 → 06 B0`; `20 00 → 0D 61`; `7F FF → 35 84` |
+| White single flashing | `LSSB=08 00` | Repeating one **white** flash; PWM toggles between `00 00` and `6B 08` |
+| White double flashing | `LSSB=09 00` | Repeating two **white** flashes; same PWM endpoints |
+
+The LSLB→LSPV mapping follows approximately `LSPV ≈ 27400 × LSLB/65535`. This is **electronic PWM**, not perceptual or physical luminance calibration. User additionally tested manual levels `1,2,5,10,20,25,30,50,60,80,100,120,140,255`; reported LSPV values tracked the requested settings consistently, with visible differences among many levels.
+
+**Transition behavior:** Original manual custom→custom implementation called `LSRB` and temporarily returned to normal firmware brightness, producing visible flashes at small step differences. The revised implementation writes `LSLB` directly while the `LSOO=1` manual override is active; user confirmed transitions are smooth without jumps but visually immediate (no intrinsic fade). `smcled --intel-fade <level> [seconds]` now provides an opt-in, software-generated smoothstep interpolation of 16-bit LSLB values; **the fade itself still needs physical testing**.
+
+**Amber intentionally unsupported on Intel:** None of the candidate `LSSB` modes `04 00` and `01 00` produced an amber light. `00 00` switched the white LED off. Modes `08 00` and `09 00` produced white, not amber, blinking. The Intel 2018 mini appears to have a white-only front LED, consistent with model-specific hardware documentation. The main CLI explicitly rejects `--amber`, `--amber-blink`, and `--amber-double` on this model. The standalone probe no longer exposes speculative amber tests, but preserves confirmed `--test-white-blink` and `--test-white-double` experiments.
+
+Do not confuse those Intel WHITE blink commands with Apple Silicon AMBER presets even when their `LSSB` payloads match. Apple Silicon amber operation remains unchanged. The new Intel controls and experiments remain on `feature/intel-lsoo-onoff-probe-20261117`; no new pull requests or changes to `main`.
+
+### 18 November 2026 — Native Apple Silicon behavior vs. Intel proportional fading
+
+Intel `Macmini8,1` user physically verified the previous `--intel-fade` smoothstep interpolation as visually successful. They requested default fading for ordinary brightness commands. The new policy is proportional: a 0→255 change takes 1 second and each smaller brightness delta uses the corresponding fraction of a second (`abs(target-current)/255`). `--no-fade` chooses direct manual writes on Intel; `--fade <level> [seconds]` is now the shared explicit interface. Very short durations can be bounded in practice by SMC write latency.
+
+**Apple Silicon behavior is deliberately preserved.** The M1 Mac mini previously showed perceptible smoothing of white LED brightness on individual `LSLN` writes, which suggests native hardware/firmware easing. Its existing 3-second automatic sunrise/sunset transitions are separate **software fades** (`fadeBrightness` writes intermediate `LSLN` values). Ordinary Apple Silicon manual brightness and amber commands keep using their prior single-write/control-channel path. When `--fade <level>` has no explicit duration, Apple Silicon also performs a native single write on the current channel. `--fade <level> <seconds>` explicitly opts into smcled-managed software easing. Do not claim Apple Silicon's hardware smoothing is fully characterized on every LED color/mode, and do not attempt to suppress it using `--no-fade`.
+
+The existing sunrise/sunset automatic scheduler is **unchanged** on Apple Silicon. Intel white-only automatic mode has **not** been enabled; it requires separate white-only schedule choices, installation/startup behavior and wake/recovery tests. This implementation is on the Intel feature branch only, not `main`.
+
+## 18 November 2026 — Intel white-only sunrise/sunset auto implementation
+
+The user physically confirmed the experimental Intel smoothstep software fade and the later proportional fade behavior. Historical implementation note: The first Intel auto prototype reused the Apple Silicon transition schedule with all colors mapped to white. This has now been superseded by the independent seven-event Intel schedule detailed below.
+
+| Solar event | Intel output |
+|---|---|
+| Sunrise − 1 hour | white 100 |
+| Sunrise | white 33 |
+| Sunrise + 1 hour | white 255 |
+| Sunset | white 100 |
+| Sunset + 1 hour | white 255 |
+| Sunset + 4 hours (or +3h for late sunsets) | white 33 |
+
+The `effectiveAutomaticMode` mapping affects preview and the Intel auto application only; existing Apple Silicon white/amber transitions and 3-second fades are preserved.
+
+Intel auto application verifies the same model-specific SMC metadata and calibration as the physically tested manual Intel path. It reads the existing solar schedule and calls the previously tested proportional `intelFadeBrightness` using the existing SMC connection. It **never** writes `LSSB` or selects an amber channel. When already at the desired steady brightness, the fade helper returns without changing SMC settings.
+
+Supported Intel workflow:
+- `./smcled --auto-preview`: read-only, reports white-only Intel plan
+- `sudo ./smcled --auto-check`: apply current white-only solar target once
+- `sudo ./smcled --install-auto [interval]`: install a root-owned one-shot LaunchDaemon (RunAtLoad + StartInterval; 300 seconds by default)
+- `./smcled --status`: report auto preference, launchd status and white-only profile
+- `sudo smcled --uninstall`: boot out the LaunchDaemon, delete managed files, and restore the Intel system-controlled normal white (`LSRB`, then `LSLB=FF FF`)
+
+**Intel fixed-mode installation is deliberately blocked**, and the LaunchDaemon refuses to apply a fixed-mode preference on Intel. Intel amber commands are unsupported. Existing Apple Silicon `--install-auto`, fixed installation and auto mode are unchanged.
+
+The code was committed to the feature branch with an offline white-only plan-mapping self-test. **Intel auto installation, reboot/wake recovery and uninstall still need on-device confirmation**; successful manual PWM and fade tests alone do not establish that launchd initialization or scheduled checks will work on this firmware.
+
+## 18 November 2026 — Revised Intel white-only automatic schedule (supersedes six-stage Intel prototype)
+
+The user specified a distinct seven-event brightness progression for the 2018 Intel Mac mini. Apple Silicon retains its original six-event white/amber plan. Both use the existing solar calculation and late-sunset cutoff (sunset hour at least 21 => final event after three hours instead of four).
+
+| Event | Intel `Macmini8,1` | Apple Silicon (unchanged) |
+|---|---|---|
+| Sunrise − 1 h | white 33 | amber 100 |
+| Sunrise | white 50 | white 33 |
+| Sunrise + 1 h | white 100 | white 255 |
+| Sunrise + 2 h | white 255 | no new event |
+| Sunset | white 100 | white 100 |
+| Sunset + 1 h | white 50 | amber 255 |
+| Sunset + 4 h (or +3 h late) | white 33 | amber 33 |
+
+`automaticTransitions(for:calendar:model:)` selects the architecture-specific schedule, and `calculateAutoPlan` builds the complete event list from those transitions. Both `--auto-preview` and `--auto-check` therefore use the same actual target rather than transforming only color labels. Offline self-tests assert exact Intel event count/brightness/mode/time, the original Apple Silicon schedule and the late-sunset three-hour behavior.
+
+Only the feature branch has been changed. The user's Intel Mac already confirmed manual brightness and fades, but the new seven-stage automatic plan still needs on-device preview, manual check and launchd verification.
