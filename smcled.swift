@@ -819,11 +819,17 @@ func intelRestoreSystem(_ smc: SMC) throws {
     // firmware-controlled mode is already active.
     let currentPWM = try smc.read("LSPV")
     let currentOff = try smc.read("LSOF")
-    if currentPWM != intelNormalPWM || currentOff != [0] {
+    let currentPreset = try smc.read("LSLB")
+    // An active manual override can coincidentally have exactly the factory
+    // PWM (e.g. LSLB=2F FF). Checking LSPV alone cannot distinguish the
+    // override from native mode. Always clear the override before restoring
+    // an altered LSLB; otherwise LSLB=FF FF would flash full brightness.
+    if currentPWM != intelNormalPWM || currentOff != [0] ||
+       currentPreset != intelDefaultLSLB {
         try smc.write("LSRB", bytes: [0])
         _ = try intelWaitFor(smc, targetPWM: intelNormalPWM, targetOff: [0], maxSeconds: 6)
     }
-    if try smc.read("LSLB") != intelDefaultLSLB {
+    if currentPreset != intelDefaultLSLB {
         try smc.write("LSLB", bytes: intelDefaultLSLB)
         guard try smc.read("LSLB") == intelDefaultLSLB else {
             throw ToolError("Intel LSLB factory preset restoration did not verify")
