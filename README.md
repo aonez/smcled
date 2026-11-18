@@ -160,28 +160,72 @@ sudo ./smcled --uninstall          # Stop automation and restore native LED beha
 
 ### Per-user command in `~/.local/bin`
 
-`sudo ./smcled --install-auto` installs the protected LaunchDaemon executable at `/Library/Application Support/smcled/smcled` and **automatically** creates `~/.local/bin/smcled` for the user who invoked `sudo`. The installer performs user-directory operations with that user's permissions, never as root.
+`sudo ./smcled --install-auto` installs the protected LaunchDaemon executable at `/Library/Application Support/smcled/smcled` and **automatically** creates `~/.local/bin/smcled` for the user who invoked `sudo`. User-directory operations run with that user's permissions, never as root.
 
-If a new zsh login/interactive shell does not already include `~/.local/bin` in its PATH, the installer appends this line to the user's `~/.zprofile` (once, without overwriting the file):
+If a new zsh login/interactive shell does not already include `~/.local/bin` in its PATH, the installer appends the following line once to the user's `~/.zprofile`, without overwriting the file:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Open a new Terminal window after installation if PATH was updated. The installer never needs to inspect, chown, or modify `/usr/local/bin`, so Homebrew ownership is not an obstacle. Existing unrelated `~/.local/bin/smcled` files or symlinks are never overwritten.
+Open a new Terminal window if PATH was updated. The installer never needs to inspect, chown, or modify `/usr/local/bin`, so Homebrew ownership is not an obstacle. Existing unrelated `~/.local/bin/smcled` files or symlinks are never overwritten.
 
-You can also set up or remove the shortcut independently, **without sudo**:
+You can set up or remove the shortcut independently, **without sudo**:
 
 ```sh
 ./smcled --install-user-cli
 ./smcled --uninstall-user-cli
 ```
 
-`sudo ./smcled --uninstall` removes the managed user shortcut for the original sudo caller, when available. The PATH entry is retained because other programs may use `~/.local/bin`.
+`sudo ./smcled --uninstall` removes the managed user shortcut for the original sudo caller when available. The PATH entry is retained because other programs may use `~/.local/bin`.
 
-Unprivileged commands such as `smcled --status`, `smcled --auto-preview`, and `smcled --help` work from your PATH. For privileged commands, prefer the **protected absolute executable path** so `sudo` never resolves a command through a user-writable directory:
+Unprivileged commands such as `smcled --status`, `smcled --auto-preview`, and `smcled --help` work from your PATH. For privileged commands, prefer the protected absolute executable path so `sudo` never resolves a command through a user-writable directory:
 
 ```sh
 sudo "/Library/Application Support/smcled/smcled" --auto-check
 sudo "/Library/Application Support/smcled/smcled" --uninstall
 ```
+
+## Check another Mac
+
+```sh
+./smcled --compatibility             # Read-only SMC key check
+./smcled --compatibility-self-test   # Offline classification self-tests
+./smcled --sample-brightness         # Read-only LSLN samples
+sudo ./smcled --test-brightness 100 --confirm-hardware-test
+sudo ./smcled --test-studio-amber --confirm-hardware-test  # Mac16,9 only
+./smcled --intel-snapshot            # Intel: read-only LED-related SMC keys
+sudo ./smcled --intel-suite --confirm-hardware-test  # Intel: three stages
+sudo ./smcled --intel-probe first 32 --confirm-hardware-test
+sudo ./smcled --intel-probe second 100 --confirm-hardware-test
+sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Legacy second-byte probe
+```
+
+`--compatibility` reports SMC metadata, not proof of physical LED behavior. M1–M4 Apple Silicon Mac mini/Studio models are recognized by identifier and require the complete LED key signature. **Untested models require** `--accept-untested-model` on write or installation commands. For unknown future model IDs, the tool additionally verifies Apple Silicon hardware, the Mac mini/Studio product family reported by macOS, a full SMC key signature, and plausible initial LED state. The flag never enables Intel or unrelated Mac families.
+
+Steady amber and white brightness have been physically verified on the M1 mini and M4 Max Studio. Flashing modes have only been tested on the M1 mini.
+
+**Intel Mac mini 2018 (`Macmini8,1`) has separately verified on/off/full-white control.** Its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. Physical tests of `LSLN` values `20 FF`, `40 FF`, and `2F 64` produced **no visible change**, even though `LSPV` followed these changes. See the Intel section above: selected dim levels are hardware-verified; experimental custom 0–255 manual brightness and white-only auto installation are available, while amber commands and fixed-mode installation remain disabled on Intel.
+
+**Intel multi-test workflow:** `--intel-suite` runs three 2-second probes on the first and second bytes in order: `2F FF → 20 FF`, `2F FF → 40 FF`, and `2F FF → 2F 64`. It restores and verifies `2F FF` after **each** test and aborts if restoration fails. `--intel-probe first|second <decimal-value>` lets you select additional probes without rebuilding; first-byte values are limited to **32–64**. `--intel-snapshot` reads related SMC keys without writing. Watch the LED during each stage; SMC readback alone does not prove any visual change.
+
+**Warning:** The old Intel `LSLN` experiments are investigative, not validated brightness controls. The new Intel `LSOO`/`LSRB` state commands have been physically verified on one unit, not across all firmware versions. All undocumented SMC writes carry recovery risks.
+
+For an untested Apple Silicon Mac mini or Mac Studio (including newer generations):
+
+```sh
+sudo ./smcled --white 100 --accept-untested-model
+sudo ./smcled --install-auto 300 --accept-untested-model
+```
+
+## Notes
+
+- Startup recovery retries SMC initialization and LED writes together (up to 15 attempts), rather than giving up before the first check.
+- Requires `sudo` to change the LED; previews and status do not.
+- The tested Apple Silicon SMC controls cannot blend white and amber simultaneously; the Intel 2018 is treated as white-only; color/amber writes are disabled.
+- **Sleep resets the LED to fixed white at 255** on the tested Apple Silicon Mac mini. No wake listener is installed; after wake, the next scheduled check reapplies the correct state. Restoration is not necessarily immediate.
+- See [research.md](research.md) for SMC details and hardware tests.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
