@@ -336,7 +336,7 @@ func compatibilitySelfTest() throws {
     for (preset, measuredPWM) in intelPoints {
         let calculated = intelPWMExpected(preset)
         guard abs(calculated - measuredPWM) <= 3 else {
-            throw ToolError("Intel PWM estimation self-test failed: LSLB=\\(hex(preset)), expected ~\\(measuredPWM), got \\(calculated)")
+            throw ToolError("Intel PWM estimation self-test failed: LSLB=\(hex(preset)), expected ~\(measuredPWM), got \(calculated)")
         }
     }
     guard intelPWMExpected([0x00, 0x00]) == 0,
