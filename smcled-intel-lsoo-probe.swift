@@ -246,32 +246,52 @@ func test(_ smc: SMC, command: UInt8, cancellation: Cancellation) throws {
     }
     if let stepError { throw stepError }
 }
-// Research-only candidate, NOT a verified Intel color command.
-// J174 MacEFI references LSSB, while Apple Silicon hardware confirmed
-// LSSB [04 00] as steady amber. The mapping on T2 is UNKNOWN. It must
-// never be applied as a normal color mode unless physically verified.
-func testAmberCandidate(_ smc: SMC, cancellation: Cancellation) throws {
+// Restricted Intel T2 color/behavior candidates. We do NOT know whether the
+// 2018 mini exposes amber through the macOS-visible LSSB interface.
+// 04/08/09 are verified amber presets on an M1 mini, NOT on Intel.
+// 00/01 are the only two LSSB payloads observed in the J174 MacEFI boot
+// signalling routine; that routine also uses LSCS, which macOS does not
+// expose on this Intel mini. Values 00/01 must NOT be called "amber modes".
+// Each test is separately confirmed, bounded and restored using LSRB.
+func testAmberCandidate(_ smc: SMC, candidate: UInt8, cancellation: Cancellation) throws {
+    let labels: [UInt8: String] = [
+        0: "J174 EFI 00 00 (boot signalling; color unknown)",
+        1: "J174 EFI 01 00 (boot signalling; color unknown)",
+        4: "M1 verified steady amber (not verified on Intel)",
+        8: "M1 verified amber single-flash (not verified on Intel)",
+        9: "M1 verified amber double-flash (not verified on Intel)"
+    ]
+    guard let label = labels[candidate] else {
+        throw TestError("Unsupported experimental LSSB candidate; refusing write")
+    }
     try checkKey(smc, "LSSB", size: 2, type: "hex_", readable: false, writable: true)
     guard try smc.read("LSLN") == [0x2F, 0xFF],
           try smc.read("LSOF") == [0],
           try smc.read("LSPV") == [0x14, 0x11],
           try smc.read("LS! ") == [0] else {
-        throw TestError("Amber experiment requires the verified normal-white baseline")
+        throw TestError("Color experiment requires verified normal-white baseline; no writes")
     }
-    print("\nUNVERIFIED Intel amber candidate: LSSB=04 00 for 2 seconds.")
-    print("Watch the LED color. SMC PWM readback cannot establish whether it is amber.")
-    var writeError: Error?
+    print("\nUNVERIFIED Intel LED mode candidate: LSSB=\(hex([candidate, 0])) for 2 seconds.")
+    print("  Source: \(label)")
+    print("  This is NOT a verified Intel amber command; observe actual LED and note color/flashes.")
+    var experimentError: Error?
     do {
         try cancellation.check()
-        try smc.write("LSSB", bytes: [4, 0])
+        try smc.write("LSSB", bytes: [candidate, 0])
         for index in 1...8 {
             try cancellation.pause(0.25)
             print("  +\(Double(index) * 0.25)s LSPV=\(hex(try smc.read("LSPV"))) LSOF=\(hex(try smc.read("LSOF")))")
         }
-    } catch { writeError = error }
-    // Attempt restoration even if the write or sampling fails.
-    try smc.write("LSRB", bytes: [0])
-    let deadline = Date().addingTimeInterval(6)
+    } catch { experimentError = error }
+
+    // Always attempt to restore normal firmware LED behavior after the
+    // experimental write, irrespective of errors in the experiment.
+    do { try smc.write("LSRB", bytes: [0]) }
+    catch {
+        err("WARNING: LSRB restore write failed: \(error)\n")
+        throw TestError("LED restoration was not possible; inspect LED and STOP")
+    }
+    let deadline = Date().addingTimeInterval(6.0)
     var restored = false
     repeat {
         let status = try smc.read("LSOF")
@@ -286,10 +306,10 @@ func testAmberCandidate(_ smc: SMC, cancellation: Cancellation) throws {
         Thread.sleep(forTimeInterval: 0.25)
     } while Date() < deadline
     guard restored else {
-        throw TestError("Amber candidate: baseline not confirmed after LSRB; inspect physical LED and STOP")
+        throw TestError("Experimental mode: baseline not confirmed after LSRB; inspect physical LED and STOP")
     }
-    print("Normal-white SMC telemetry restored. Was the LED amber, white, or unchanged?")
-    if let writeError { throw writeError }
+    print("  Normal-white telemetry restored. Report observed color, pattern, and brightness.")
+    if let experimentError { throw experimentError }
 }
 // Research-only Intel brightness candidate. LSLB is the historical "Full On"
 // PWM preset, and LSOO=1 was physically verified to force full-white on this
@@ -378,7 +398,7 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, low: Bo
 func run() throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count == 1 || args.count == 2 else {
-        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--test-amber|--test-full-dim|--test-low-dim|--suite --confirm-hardware-test")
+        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--test-amber|--test-amber-fw0|--test-amber-fw1|--test-amber-blink|--test-amber-double|--test-full-dim|--test-low-dim|--suite --confirm-hardware-test")
     }
     guard modelID() == "Macmini8,1" else { throw TestError("Only Macmini8,1 is supported") }
     let smc = try SMC()
@@ -387,7 +407,7 @@ func run() throws {
         return
     }
     guard args.count == 2, args[1] == "--confirm-hardware-test",
-          ["--test-off", "--test-on", "--test-amber", "--test-full-dim", "--test-low-dim", "--suite"].contains(args[0]) else {
+          ["--test-off", "--test-on", "--test-amber", "--test-amber-fw0", "--test-amber-fw1", "--test-amber-blink", "--test-amber-double", "--test-full-dim", "--test-low-dim", "--suite"].contains(args[0]) else {
         throw TestError("Invalid command or missing explicit confirmation")
     }
     try preflight(smc)
@@ -406,8 +426,13 @@ func run() throws {
             snapshot(smc, heading: "Final post-test snapshot:")
         } catch { err("WARNING: final state inspection/emergency restore failed: \(error)\n") }
     }
-    if args[0] == "--test-amber" {
-        try testAmberCandidate(smc, cancellation: cancellation)
+    if ["--test-amber", "--test-amber-fw0", "--test-amber-fw1",
+        "--test-amber-blink", "--test-amber-double"].contains(args[0]) {
+        let candidates: [String: UInt8] = [
+            "--test-amber": 4, "--test-amber-fw0": 0, "--test-amber-fw1": 1,
+            "--test-amber-blink": 8, "--test-amber-double": 9
+        ]
+        try testAmberCandidate(smc, candidate: candidates[args[0]]!, cancellation: cancellation)
     } else if args[0] == "--test-full-dim" || args[0] == "--test-low-dim" {
         try testFullBrightnessCandidate(smc, cancellation: cancellation,
                                         low: args[0] == "--test-low-dim")
