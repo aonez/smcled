@@ -123,18 +123,19 @@ On both architectures, an explicit `--fade <level> [seconds]` with a supplied du
 
 ## Automatic sunrise/sunset mode
 
-The solar schedule uses the same six transitions on both supported hardware families. **Apple Silicon retains white/amber behavior**; the **2018 Intel Mac mini uses white only** at those exact brightness levels.
+The solar calculations are shared, but the **2018 Intel Mac mini and Apple Silicon have separate schedules**. Intel uses seven **white-only** brightness transitions, including an additional `Sunrise + 2 hours` event. Apple Silicon keeps its original six white/amber transitions.
 
-| Solar event | Apple Silicon | Intel Mac mini 2018 |
+| Solar event | Intel Mac mini 2018 | Apple Silicon |
 |---|---|---|
-| Sunrise − 1 hour | Amber `100` | White `100` |
-| Sunrise | White `33` | White `33` |
-| Sunrise + 1 hour | White `255` | White `255` |
+| Sunrise − 1 hour | White `33` | Amber `100` |
+| Sunrise | White `50` | White `33` |
+| Sunrise + 1 hour | White `100` | White `255` |
+| Sunrise + 2 hours | White `255` | No transition |
 | Sunset | White `100` | White `100` |
-| Sunset + 1 hour | Amber `255` | White `255` |
-| Sunset + 4 hours | Amber `33` | White `33` |
+| Sunset + 1 hour | White `50` | Amber `255` |
+| Sunset + 4 hours | White `33` | Amber `33` |
 
-For sunsets at **21:00 or later**, the final event occurs **3 hours** after sunset instead of 4. Apple Silicon keeps its original **3-second software fades**, including fade-through-darkness when changing colors. Intel uses white-only proportional fades: a 255-level difference is one second, and smaller differences take the corresponding fraction. Actual timing can be affected by SMC transaction latency.
+For sunsets at **21:00 or later**, the final transition occurs after **3 hours** instead of 4 on both architectures. Apple Silicon retains its existing three-second software fades and color transitions; Intel uses its proportional white-brightness fade (a 255-level change takes one second).
 
 ### Preview and test safely
 
