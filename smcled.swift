@@ -384,13 +384,54 @@ func compatibilitySelfTest() throws {
         throw ToolError("Proportional fade step count self-test failed")
     }
     print("PASS: Relative one-second full-range fade timing")
-    guard effectiveAutomaticMode(.amber, for: "Macmini8,1") == .white,
-          effectiveAutomaticMode(.white, for: "Macmini8,1") == .white,
-          effectiveAutomaticMode(.amber, for: "Macmini9,1") == .amber,
-          effectiveAutomaticMode(.amber, for: "Mac16,9") == .amber else {
-        throw ToolError("Intel white-only automatic profile mapping self-test failed")
+    // Deterministic solar-day tests, no system location/SMC access.
+    let utc = TimeZone(secondsFromGMT: 0)!
+    let calendar = configuredCalendar(utc)
+    let sunrise = Date(timeIntervalSince1970: 6 * 3600)
+    let sunset = Date(timeIntervalSince1970: 20 * 3600)
+    let day = SolarDay(sunrise: sunrise, sunset: sunset)
+    let intelEvents = automaticTransitions(for: day, calendar: calendar, model: "Macmini8,1")
+    let appleEvents = automaticTransitions(for: day, calendar: calendar, model: "Macmini9,1")
+    let intelExpected: [(TimeInterval, UInt8)] = [
+        (sunrise.timeIntervalSince1970 - 3600, 33),
+        (sunrise.timeIntervalSince1970, 50),
+        (sunrise.timeIntervalSince1970 + 3600, 100),
+        (sunrise.timeIntervalSince1970 + 7200, 255),
+        (sunset.timeIntervalSince1970, 100),
+        (sunset.timeIntervalSince1970 + 3600, 50),
+        (sunset.timeIntervalSince1970 + 14400, 33)
+    ]
+    guard intelEvents.count == 7,
+          zip(intelEvents, intelExpected).allSatisfy({
+              $0.0.mode == .white &&
+              $0.0.brightness == $0.1.1 &&
+              $0.0.date.timeIntervalSince1970 == $0.1.0
+          }) else {
+        throw ToolError("Intel white-only seven-stage solar schedule self-test failed")
     }
-    print("PASS: Intel automatic profile maps amber events to white; Apple Silicon unchanged")
+    guard appleEvents.count == 6,
+          appleEvents.map({ $0.brightness }) == [100, 33, 255, 100, 255, 33],
+          appleEvents.map({ $0.mode }) == [.amber, .white, .white, .white, .amber, .amber],
+          appleEvents.map({ $0.date.timeIntervalSince1970 }) ==
+            [sunrise.timeIntervalSince1970 - 3600,
+             sunrise.timeIntervalSince1970,
+             sunrise.timeIntervalSince1970 + 3600,
+             sunset.timeIntervalSince1970,
+             sunset.timeIntervalSince1970 + 3600,
+             sunset.timeIntervalSince1970 + 14400] else {
+        throw ToolError("Apple Silicon original solar schedule self-test failed")
+    }
+    let lateSunset = Date(timeIntervalSince1970: 21 * 3600)
+    let lateDay = SolarDay(sunrise: sunrise, sunset: lateSunset)
+    for model in ["Macmini8,1", "Macmini9,1"] {
+        let lateEvents = automaticTransitions(for: lateDay, calendar: calendar, model: model)
+        guard lateEvents.last?.date == lateSunset.addingTimeInterval(10800),
+              lateEvents.last?.brightness == 33 else {
+            throw ToolError("Late-sunset +3h auto schedule self-test failed on \(model)")
+        }
+    }
+    print("PASS: Intel 7-stage white-only schedule; Apple Silicon 6-stage schedule unchanged")
+    print("PASS: late-sunset +3h timing on both architectures")
     guard looksLikeModernMacIdentifier("Mac17,9"),
           looksLikeModernMacIdentifier("Mac27,12"),
           !looksLikeModernMacIdentifier("Macmini8,1"),
@@ -2165,6 +2206,49 @@ struct AutomaticPlan {
     let next: LEDTransition?
 }
 
+// Distinct solar schedules: Intel 2018 has a white-only seven-stage brightness
+// progression. Apple Silicon retains the original six white/amber transitions.
+func automaticTransitions(for day: SolarDay, calendar: Calendar, model: String) -> [LEDTransition] {
+    let sunsetHour = calendar.component(.hour, from: day.sunset)
+    let late = sunsetHour >= 21
+    let finalOffset: TimeInterval = late ? 10_800 : 14_400
+    let finalDescription = late ? "Sunset + 3h (late sunset)" : "Sunset + 4h"
+    if model == "Macmini8,1" {
+        return [
+            LEDTransition(date: day.sunrise.addingTimeInterval(-3600), mode: .white,
+                          brightness: 33, description: "Sunrise - 1h"),
+            LEDTransition(date: day.sunrise, mode: .white,
+                          brightness: 50, description: "Sunrise"),
+            LEDTransition(date: day.sunrise.addingTimeInterval(3600), mode: .white,
+                          brightness: 100, description: "Sunrise + 1h"),
+            LEDTransition(date: day.sunrise.addingTimeInterval(7200), mode: .white,
+                          brightness: 255, description: "Sunrise + 2h"),
+            LEDTransition(date: day.sunset, mode: .white,
+                          brightness: 100, description: "Sunset"),
+            LEDTransition(date: day.sunset.addingTimeInterval(3600), mode: .white,
+                          brightness: 50, description: "Sunset + 1h"),
+            LEDTransition(date: day.sunset.addingTimeInterval(finalOffset), mode: .white,
+                          brightness: 33, description: finalDescription)
+        ]
+    }
+    // Original Apple Silicon behavior: DO NOT change these event times,
+    // brightness values, mode choices, or late-sunset handling.
+    return [
+        LEDTransition(date: day.sunrise.addingTimeInterval(-3600), mode: .amber,
+                      brightness: 100, description: "Sunrise - 1h"),
+        LEDTransition(date: day.sunrise, mode: .white,
+                      brightness: 33, description: "Sunrise"),
+        LEDTransition(date: day.sunrise.addingTimeInterval(3600), mode: .white,
+                      brightness: 255, description: "Sunrise + 1h"),
+        LEDTransition(date: day.sunset, mode: .white,
+                      brightness: 100, description: "Sunset"),
+        LEDTransition(date: day.sunset.addingTimeInterval(3600), mode: .amber,
+                      brightness: 255, description: "Sunset + 1h"),
+        LEDTransition(date: day.sunset.addingTimeInterval(finalOffset), mode: .amber,
+                      brightness: 33, description: finalDescription)
+    ]
+}
+
 func calculateAutoPlan(at now: Date, location explicit: SolarLocation? = nil) throws -> AutomaticPlan {
     let source: String
     let zone: TimeZone
@@ -2189,25 +2273,10 @@ func calculateAutoPlan(at now: Date, location explicit: SolarLocation? = nil) th
         days = fallback.2
     }
     let calendar = configuredCalendar(zone)
+    let model = modelID()
     var events: [LEDTransition] = []
     for day in days {
-        let sunsetHour = calendar.component(.hour, from: day.sunset)
-        let late = sunsetHour >= 21
-        events += [
-            LEDTransition(date: day.sunrise.addingTimeInterval(-3600), mode: .amber,
-                          brightness: 100, description: "Sunrise - 1h"),
-            LEDTransition(date: day.sunrise, mode: .white,
-                          brightness: 33, description: "Sunrise"),
-            LEDTransition(date: day.sunrise.addingTimeInterval(3600), mode: .white,
-                          brightness: 255, description: "Sunrise + 1h"),
-            LEDTransition(date: day.sunset, mode: .white,
-                          brightness: 100, description: "Sunset"),
-            LEDTransition(date: day.sunset.addingTimeInterval(3600), mode: .amber,
-                          brightness: 255, description: "Sunset + 1h"),
-            LEDTransition(date: day.sunset.addingTimeInterval(late ? 10800 : 14400),
-                          mode: .amber, brightness: 33,
-                          description: late ? "Sunset + 3h (late sunset)" : "Sunset + 4h")
-        ]
+        events.append(contentsOf: automaticTransitions(for: day, calendar: calendar, model: model))
     }
     events.sort { $0.date < $1.date }
     guard let active = events.last(where: { $0.date <= now }) else {
@@ -2225,13 +2294,6 @@ func solarFormatter(_ zone: TimeZone) -> DateFormatter {
     return formatter
 }
 
-// Keep the same solar time/brightness plan across both architectures.
-// Intel 2018 has white-only hardware: ignore the plan's amber channel without
-// changing its six transition times or brightness values.
-func effectiveAutomaticMode(_ scheduled: LEDMode, for model: String) -> LEDMode {
-    model == "Macmini8,1" ? .white : scheduled
-}
-
 func previewAutomaticLED(location: SolarLocation? = nil) throws {
     let now = Date()
     let plan = try calculateAutoPlan(at: now, location: location)
@@ -2241,7 +2303,7 @@ func previewAutomaticLED(location: SolarLocation? = nil) throws {
     print("Solar source: \(plan.source)")
     let model = modelID()
     if model == "Macmini8,1" {
-        print("Automatic LED profile: Intel 2018 white-only (all scheduled color stages become white)")
+        print("Automatic LED profile: Intel 2018 white-only (seven brightness transitions)")
     }
     print("Current time: \(f.string(from: now))")
     for day in plan.days where cal.isDate(day.sunrise, inSameDayAs: today) {
@@ -2254,15 +2316,12 @@ func previewAutomaticLED(location: SolarLocation? = nil) throws {
     for day in plan.days where cal.isDate(day.sunrise, inSameDayAs: today) {
         for event in plan.events where event.date >= day.sunrise.addingTimeInterval(-3600)
                               && event.date <= day.sunset.addingTimeInterval(14400) {
-            let displayedMode = effectiveAutomaticMode(event.mode, for: model)
-            print("  \(f.string(from: event.date))  \(displayedMode.rawValue) \(event.brightness)  [\(event.description)]")
+            print("  \(f.string(from: event.date))  \(event.mode.rawValue) \(event.brightness)  [\(event.description)]")
         }
     }
-    let targetMode = effectiveAutomaticMode(plan.target.mode, for: model)
-    print("Target now: \(targetMode.rawValue) \(plan.target.brightness)")
+    print("Target now: \(plan.target.mode.rawValue) \(plan.target.brightness)")
     if let next = plan.next {
-        let nextMode = effectiveAutomaticMode(next.mode, for: model)
-        print("Next transition: \(f.string(from: next.date))  \(nextMode.rawValue) \(next.brightness)")
+        print("Next transition: \(f.string(from: next.date))  \(next.mode.rawValue) \(next.brightness)")
     } else { print("Next transition unavailable: CoreBrightness did not provide enough future events") }
     print("Dry run only: no SMC write performed.")
 }
@@ -2291,8 +2350,8 @@ func applyIntelAutomaticLED(_ smc: SMC) throws {
     try checkIntelSIL(smc)
     let plan = try calculateAutoPlan(at: Date())
     let target = plan.target.brightness
-    guard effectiveAutomaticMode(plan.target.mode, for: "Macmini8,1") == .white else {
-        throw ToolError("Intel automatic profile must remain white-only")
+    guard plan.events.allSatisfy({ $0.mode == .white }) else {
+        throw ToolError("Intel automatic profile contains a non-white event; refusing SMC writes")
     }
     try intelFadeBrightness(target, smc: smc, automatic: true)
     print("Intel white-only auto: \(plan.target.description) -> white \(target)/255")
