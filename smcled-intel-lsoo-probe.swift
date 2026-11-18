@@ -295,7 +295,7 @@ func testAmberCandidate(_ smc: SMC, cancellation: Cancellation) throws {
 // PWM preset, and LSOO=1 was physically verified to force full-white on this
 // exact Macmini8,1. Whether modifying LSLB changes physical brightness remains
 // UNKNOWN. A single half-scale value is tried, restored unconditionally.
-func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation) throws {
+func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, low: Bool = false) throws {
     try checkKey(smc, "LSLB", size: 2, type: "ui16", readable: true, writable: true)
     try checkKey(smc, "LSSV", size: 2, type: "ui16", readable: true, writable: true)
     let original = try smc.read("LSLB")
@@ -307,9 +307,13 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation) throws 
           try smc.read("LS! ") == [0] else {
         throw TestError("LSLB test requires exact verified normal-white baseline; no SMC writes attempted")
     }
-    let candidate: [UInt8] = [0x7F, 0xFF]
+    // 7F FF produced exactly half the full PWM, but that is still 2.67x
+    // the normal-white PWM. 10 00 should produce ~1/3 of normal PWM.
+    // Only these two bounded profiles are exposed for research.
+    let candidate: [UInt8] = low ? [0x10, 0x00] : [0x7F, 0xFF]
     print("\nUNVERIFIED Intel variable-brightness experiment:")
-    print("  Set LSLB FF FF -> 7F FF (approximately half of raw full-on preset).")
+    print("  Set LSLB FF FF -> \(hex(candidate)) " +
+          (low ? "(predicted PWM below normal-white)" : "(approximately half of full-white PWM)"))
     print("  Then invoke verified LSOO=1 for 2s; measure LSPV and observe the physical LED.")
     print("  Always restore LSLB=FF FF, then LSRB=0 and check normal-white telemetry.")
     var testFailure: Error?
@@ -374,7 +378,7 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation) throws 
 func run() throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count == 1 || args.count == 2 else {
-        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--test-amber|--test-full-dim|--suite --confirm-hardware-test")
+        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--test-amber|--test-full-dim|--test-low-dim|--suite --confirm-hardware-test")
     }
     guard modelID() == "Macmini8,1" else { throw TestError("Only Macmini8,1 is supported") }
     let smc = try SMC()
@@ -383,7 +387,7 @@ func run() throws {
         return
     }
     guard args.count == 2, args[1] == "--confirm-hardware-test",
-          ["--test-off", "--test-on", "--test-amber", "--test-full-dim", "--suite"].contains(args[0]) else {
+          ["--test-off", "--test-on", "--test-amber", "--test-full-dim", "--test-low-dim", "--suite"].contains(args[0]) else {
         throw TestError("Invalid command or missing explicit confirmation")
     }
     try preflight(smc)
@@ -404,8 +408,9 @@ func run() throws {
     }
     if args[0] == "--test-amber" {
         try testAmberCandidate(smc, cancellation: cancellation)
-    } else if args[0] == "--test-full-dim" {
-        try testFullBrightnessCandidate(smc, cancellation: cancellation)
+    } else if args[0] == "--test-full-dim" || args[0] == "--test-low-dim" {
+        try testFullBrightnessCandidate(smc, cancellation: cancellation,
+                                        low: args[0] == "--test-low-dim")
     } else {
         let commands: [UInt8] = args[0] == "--suite" ? [0, 1] : [args[0] == "--test-off" ? 0 : 1]
         for value in commands { try test(smc, command: value, cancellation: cancellation) }
