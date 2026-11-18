@@ -1,4 +1,4 @@
-// smcled.swift — AppleSMC power LED CLI for Apple Silicon Mac mini and Studio
+// smcled.swift — AppleSMC status LED CLI for supported Mac mini and Mac Studio
 // No Apple-private headers, third-party dependencies, kext, or SIP changes.
 // Verified on Macmini9,1: white PWM and three amber presets.
 // Confirmed: LSLN controls brightness on steady amber (tested at 10 and 50).
@@ -936,7 +936,7 @@ func intelFadePreset(from start: Int, to end: Int, step: Int, steps: Int) -> Int
 }
 
 func intelFadeBrightness(_ level: UInt8, duration explicitDuration: TimeInterval? = nil,
-                         smc existingSMC: SMC? = nil) throws {
+                         smc existingSMC: SMC? = nil, automatic: Bool = false) throws {
     if let explicitDuration {
         guard explicitDuration.isFinite, (0.01...15.0).contains(explicitDuration) else {
             throw ToolError("Fade duration must be between 0.01 and 15 seconds")
@@ -1023,7 +1023,9 @@ func intelFadeBrightness(_ level: UInt8, duration explicitDuration: TimeInterval
             }
         }
         print("Intel white brightness faded to \(level)/255 over \(duration)s.")
-        print("Manual mode remains active; use --reset for firmware-controlled white.")
+        if !automatic {
+            print("Manual mode remains active; use --reset for firmware-controlled white.")
+        }
     } catch {
         writeStderr("WARNING: Intel fade interrupted or failed: \(error). Attempting system restoration.\n")
         do { try intelRestoreSystem(smc) }
@@ -2292,7 +2294,7 @@ func applyIntelAutomaticLED(_ smc: SMC) throws {
     guard effectiveAutomaticMode(plan.target.mode, for: "Macmini8,1") == .white else {
         throw ToolError("Intel automatic profile must remain white-only")
     }
-    try intelFadeBrightness(target, smc: smc)
+    try intelFadeBrightness(target, smc: smc, automatic: true)
     print("Intel white-only auto: \(plan.target.description) -> white \(target)/255")
 }
 
