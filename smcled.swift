@@ -222,7 +222,7 @@ func reportCompatibility() throws {
         print("Mac model: \(model)")
         print("SMC LED interface: Intel T2 (off/full-white/normal-white physically verified on one unit)")
         print("  Available: --off, --intel-full, --reset, --intel-restore, --white [0...255], --intel-brightness <0...255>")
-        print("  Manual 0...255 levels are experimental; installation and amber/color commands remain blocked.")
+        print("  Manual 0...255 levels and white-only --install-auto are supported; amber/color and fixed-mode installation remain disabled.")
         try intelSILStatus()
         return
     }
@@ -384,6 +384,13 @@ func compatibilitySelfTest() throws {
         throw ToolError("Proportional fade step count self-test failed")
     }
     print("PASS: Relative one-second full-range fade timing")
+    guard effectiveAutomaticMode(.amber, for: "Macmini8,1") == .white,
+          effectiveAutomaticMode(.white, for: "Macmini8,1") == .white,
+          effectiveAutomaticMode(.amber, for: "Macmini9,1") == .amber,
+          effectiveAutomaticMode(.amber, for: "Mac16,9") == .amber else {
+        throw ToolError("Intel white-only automatic profile mapping self-test failed")
+    }
+    print("PASS: Intel automatic profile maps amber events to white; Apple Silicon unchanged")
     guard looksLikeModernMacIdentifier("Mac17,9"),
           looksLikeModernMacIdentifier("Mac27,12"),
           !looksLikeModernMacIdentifier("Macmini8,1"),
@@ -922,13 +929,14 @@ func intelFadePreset(from start: Int, to end: Int, step: Int, steps: Int) -> Int
     return max(0, min(65535, Int((Double(start) + Double(end - start) * eased).rounded())))
 }
 
-func intelFadeBrightness(_ level: UInt8, duration explicitDuration: TimeInterval? = nil) throws {
+func intelFadeBrightness(_ level: UInt8, duration explicitDuration: TimeInterval? = nil,
+                         smc existingSMC: SMC? = nil) throws {
     if let explicitDuration {
         guard explicitDuration.isFinite, (0.01...15.0).contains(explicitDuration) else {
             throw ToolError("Fade duration must be between 0.01 and 15 seconds")
         }
     }
-    let smc = try SMC()
+    let smc = try existingSMC ?? SMC()
     try checkIntelSIL(smc)
     let (currentPreset, currentPWM, currentOff) = try intelStableState(smc)
     let wasOff = currentOff == [1]
@@ -1187,13 +1195,20 @@ func writeManagedFile(_ path: String, data: Data, executable: Bool = false) thro
 
 func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: Bool = false, interval: Int = 300) throws {
     try requireRoot()
-    try requireSupportedLEDHost()
+    let intel = modelID() == "Macmini8,1"
+    guard !intel || automatic else {
+        throw ToolError("Intel Mac mini supports --install-auto only; fixed-mode installation is disabled")
+    }
     // Validate solar-time source before modifying a previously working installation.
     if automatic { _ = try calculateAutoPlan(at: Date()) }
     // Check access and metadata before touching the installation.
     let smc = try SMC()
-    try requireSupportedLEDHost(smc: smc)
-    try checkLEDKeys(smc, includeModes: true)
+    if intel {
+        try checkIntelSIL(smc)
+    } else {
+        try requireSupportedLEDHost(smc: smc)
+        try checkLEDKeys(smc, includeModes: true)
+    }
 
     let fm = FileManager.default
     let exists = try validateManagedPath(installDirectory, directory: true)
@@ -1225,7 +1240,9 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     }
     try writeManagedFile(brightnessPreference, data: Data("\(brightness)\n".utf8))
     try writeManagedFile(modePreference, data: Data("\(automatic ? "auto" : mode.rawValue)\n".utf8))
-    try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval, acknowledged: !physicallyTestedDesktops.contains(modelID())))
+    let needsExperimentalAcknowledgment = !intel && !physicallyTestedDesktops.contains(modelID())
+    try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval,
+                                                          acknowledged: needsExperimentalAcknowledgment))
     try installCLILink()
     // A previously disabled service must be re-enabled explicitly.
     _ = try callLaunchctl(["enable", "system/" + jobLabel])
@@ -1235,7 +1252,7 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     // from this installer: two concurrent SMC fade loops would interfere.
     if !automatic { try applyKnownLED(smc, mode: mode, brightness: brightness) }
     print(automatic
-          ? "Installed \(jobLabel); automatic sunrise/sunset mode (every \(interval) seconds)."
+          ? "Installed \(jobLabel); \(intel ? "Intel white-only" : "white/amber") automatic sunrise/sunset mode (every \(interval) seconds)."
           : "Installed \(jobLabel); saved mode \(mode.rawValue), brightness \(brightness).")
     print("Boot-time job: \(daemonPlist)")
     print("Shell command: \(cliLink) (sudo required to write)")
@@ -1292,9 +1309,16 @@ func applyInstalledBrightness() throws {
     for attempt in 1...15 {
         do {
             let smc = try SMC()
-            try requireSupportedLEDHost(smc: smc)
-            if modeName == "auto" { try applyAutomaticLED(smc) }
-            else { try applyKnownLED(smc, mode: LEDMode(rawValue: modeName)!, brightness: brightness) }
+            if modelID() == "Macmini8,1" {
+                guard modeName == "auto" else {
+                    throw ToolError("Intel installed mode must be auto (white-only); fixed modes are unsupported")
+                }
+                try applyIntelAutomaticLED(smc)
+            } else {
+                try requireSupportedLEDHost(smc: smc)
+                if modeName == "auto" { try applyAutomaticLED(smc) }
+                else { try applyKnownLED(smc, mode: LEDMode(rawValue: modeName)!, brightness: brightness) }
+            }
             return
         } catch {
             lastError = error
@@ -1329,8 +1353,13 @@ func uninstallBrightness() throws {
     }
     // Restore the factory brightness where possible before deleting files.
     do {
-        try setKnownLEDBrightness(255)
-        print("Restored normal LED brightness (255).")
+        if modelID() == "Macmini8,1" {
+            try applyIntelSIL(.normal)
+            print("Restored Intel system-controlled white LED.")
+        } else {
+            try setKnownLEDBrightness(255)
+            print("Restored normal LED brightness (255).")
+        }
     } catch {
         writeStderr("WARNING: Could not restore LED brightness: \(error)\n")
     }
@@ -1352,6 +1381,7 @@ func installationStatus() throws {
         let installedMode = try readInstalledModeName()
         print("Configured mode: \(installedMode)")
         if installedMode == "auto" {
+            if modelID() == "Macmini8,1" { print("Auto color profile: white only (Intel Macmini8,1)") }
             if plist {
                 let data = try Data(contentsOf: URL(fileURLWithPath: daemonPlist))
                 let properties = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
@@ -2183,6 +2213,13 @@ func solarFormatter(_ zone: TimeZone) -> DateFormatter {
     return formatter
 }
 
+// Keep the same solar time/brightness plan across both architectures.
+// Intel 2018 has white-only hardware: ignore the plan's amber channel without
+// changing its six transition times or brightness values.
+func effectiveAutomaticMode(_ scheduled: LEDMode, for model: String) -> LEDMode {
+    model == "Macmini8,1" ? .white : scheduled
+}
+
 func previewAutomaticLED(location: SolarLocation? = nil) throws {
     let now = Date()
     let plan = try calculateAutoPlan(at: now, location: location)
@@ -2190,6 +2227,10 @@ func previewAutomaticLED(location: SolarLocation? = nil) throws {
     let cal = configuredCalendar(plan.zone)
     let today = cal.startOfDay(for: now)
     print("Solar source: \(plan.source)")
+    let model = modelID()
+    if model == "Macmini8,1" {
+        print("Automatic LED profile: Intel 2018 white-only (all scheduled color stages become white)")
+    }
     print("Current time: \(f.string(from: now))")
     for day in plan.days where cal.isDate(day.sunrise, inSameDayAs: today) {
         print("Sunrise: \(f.string(from: day.sunrise))")
@@ -2201,12 +2242,15 @@ func previewAutomaticLED(location: SolarLocation? = nil) throws {
     for day in plan.days where cal.isDate(day.sunrise, inSameDayAs: today) {
         for event in plan.events where event.date >= day.sunrise.addingTimeInterval(-3600)
                               && event.date <= day.sunset.addingTimeInterval(14400) {
-            print("  \(f.string(from: event.date))  \(event.mode.rawValue) \(event.brightness)  [\(event.description)]")
+            let displayedMode = effectiveAutomaticMode(event.mode, for: model)
+            print("  \(f.string(from: event.date))  \(displayedMode.rawValue) \(event.brightness)  [\(event.description)]")
         }
     }
-    print("Target now: \(plan.target.mode.rawValue) \(plan.target.brightness)")
+    let targetMode = effectiveAutomaticMode(plan.target.mode, for: model)
+    print("Target now: \(targetMode.rawValue) \(plan.target.brightness)")
     if let next = plan.next {
-        print("Next transition: \(f.string(from: next.date))  \(next.mode.rawValue) \(next.brightness)")
+        let nextMode = effectiveAutomaticMode(next.mode, for: model)
+        print("Next transition: \(f.string(from: next.date))  \(nextMode.rawValue) \(next.brightness)")
     } else { print("Next transition unavailable: CoreBrightness did not provide enough future events") }
     print("Dry run only: no SMC write performed.")
 }
@@ -2229,8 +2273,25 @@ func fadeBrightness(_ smc: SMC, from start: UInt8, to end: UInt8,
     }
 }
 
+// Reuse the same six solar transitions, but use Intel's proportional 16-bit
+// LSLB software fade and NEVER send an amber/channel-select command.
+func applyIntelAutomaticLED(_ smc: SMC) throws {
+    try checkIntelSIL(smc)
+    let plan = try calculateAutoPlan(at: Date())
+    let target = plan.target.brightness
+    guard effectiveAutomaticMode(plan.target.mode, for: "Macmini8,1") == .white else {
+        throw ToolError("Intel automatic profile must remain white-only")
+    }
+    try intelFadeBrightness(target, smc: smc)
+    print("Intel white-only auto: \(plan.target.description) -> white \(target)/255")
+}
+
 func applyAutomaticLED(_ smc: SMC) throws {
     try requireRoot()
+    if modelID() == "Macmini8,1" {
+        try applyIntelAutomaticLED(smc)
+        return
+    }
     try requireSupportedLEDHost(smc: smc)
     try checkLEDKeys(smc, includeModes: true)
     let target = try calculateAutoPlan(at: Date()).target
@@ -2322,7 +2383,8 @@ func usage() {
       # Intel 2018: --off turns LED off; --reset or --white restores
       # Intel 2018: --white 50 or bare 50 also sets custom white level
       # Manual brightness commands fade by default; --no-fade opts out
-      # Intel 2018: amber and installation remain disabled
+      # Intel 2018: amber and fixed-mode installation remain disabled
+      # Intel 2018: --install-auto uses the same schedule, white brightness only
 
       sudo smcled --install 10           Persist white brightness 10
       sudo smcled --install white 10     Persist white brightness 10
@@ -2333,6 +2395,7 @@ func usage() {
                                           Persist double flashing amber at 50
       sudo smcled --install-auto [seconds]
                                           Sunrise/sunset checks; 300s default (30...86400)
+                                          Intel 2018: white-only; Apple Silicon: white/amber
       smcled --auto-preview               Show today's solar events & LED plan
       smcled --auto-preview <lat> <lon> <IANA-timezone>
                                           Preview with explicit coordinates
@@ -2540,7 +2603,6 @@ func run(_ originalArguments: [String]) throws {
     case "--auto-check":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --auto-check") }
         try requireRoot()
-        try requireSupportedLEDHost()
         try applyAutomaticLED(SMC())
         return
     case "--install-auto":
