@@ -246,52 +246,39 @@ func test(_ smc: SMC, command: UInt8, cancellation: Cancellation) throws {
     }
     if let stepError { throw stepError }
 }
-// Restricted Intel T2 color/behavior candidates. We do NOT know whether the
-// 2018 mini exposes amber through the macOS-visible LSSB interface.
-// 04/08/09 are verified amber presets on an M1 mini, NOT on Intel.
-// 00/01 are the only two LSSB payloads observed in the J174 MacEFI boot
-// signalling routine; that routine also uses LSCS, which macOS does not
-// expose on this Intel mini. Values 00/01 must NOT be called "amber modes".
-// Each test is separately confirmed, bounded and restored using LSRB.
-func testAmberCandidate(_ smc: SMC, candidate: UInt8, cancellation: Cancellation) throws {
-    let labels: [UInt8: String] = [
-        0: "J174 EFI 00 00 (boot signalling; color unknown)",
-        1: "J174 EFI 01 00 (boot signalling; color unknown)",
-        4: "M1 verified steady amber (not verified on Intel)",
-        8: "M1 verified amber single-flash (not verified on Intel)",
-        9: "M1 verified amber double-flash (not verified on Intel)"
-    ]
-    guard let label = labels[candidate] else {
-        throw TestError("Unsupported experimental LSSB candidate; refusing write")
+// Physically verified WHITE status-light patterns on Macmini8,1.
+// LSSB 08 00 -> repeating single white flash.
+// LSSB 09 00 -> repeating double white flash.
+// The 2018 Intel mini does not have verified amber/color hardware.
+// The ineffective/speculative Intel "amber" tests were retired.
+func testWhiteBlink(_ smc: SMC, mode: UInt8, cancellation: Cancellation) throws {
+    guard mode == 8 || mode == 9 else {
+        throw TestError("Only the physically verified Intel white blink modes 8 and 9 are allowed")
     }
     try checkKey(smc, "LSSB", size: 2, type: "hex_", readable: false, writable: true)
     guard try smc.read("LSLN") == [0x2F, 0xFF],
           try smc.read("LSOF") == [0],
           try smc.read("LSPV") == [0x14, 0x11],
           try smc.read("LS! ") == [0] else {
-        throw TestError("Color experiment requires verified normal-white baseline; no writes")
+        throw TestError("White blink diagnostic requires normal-white baseline; no writes")
     }
-    print("\nUNVERIFIED Intel LED mode candidate: LSSB=\(hex([candidate, 0])) for 2 seconds.")
-    print("  Source: \(label)")
-    print("  This is NOT a verified Intel amber command; observe actual LED and note color/flashes.")
+    let label = mode == 8 ? "single" : "double"
+    print("\nIntel \(label) WHITE blink, LSSB=\(hex([mode, 0])), for 2 seconds.")
     var experimentError: Error?
     do {
         try cancellation.check()
-        try smc.write("LSSB", bytes: [candidate, 0])
+        try smc.write("LSSB", bytes: [mode, 0])
         for index in 1...8 {
             try cancellation.pause(0.25)
             print("  +\(Double(index) * 0.25)s LSPV=\(hex(try smc.read("LSPV"))) LSOF=\(hex(try smc.read("LSOF")))")
         }
     } catch { experimentError = error }
-
-    // Always attempt to restore normal firmware LED behavior after the
-    // experimental write, irrespective of errors in the experiment.
     do { try smc.write("LSRB", bytes: [0]) }
     catch {
         err("WARNING: LSRB restore write failed: \(error)\n")
-        throw TestError("LED restoration was not possible; inspect LED and STOP")
+        throw TestError("White blink restoration failed; inspect LED and STOP")
     }
-    let deadline = Date().addingTimeInterval(6.0)
+    let deadline = Date().addingTimeInterval(6)
     var restored = false
     repeat {
         let status = try smc.read("LSOF")
@@ -306,9 +293,9 @@ func testAmberCandidate(_ smc: SMC, candidate: UInt8, cancellation: Cancellation
         Thread.sleep(forTimeInterval: 0.25)
     } while Date() < deadline
     guard restored else {
-        throw TestError("Experimental mode: baseline not confirmed after LSRB; inspect physical LED and STOP")
+        throw TestError("Intel white blink did not restore baseline; inspect physical LED and STOP")
     }
-    print("  Normal-white telemetry restored. Report observed color, pattern, and brightness.")
+    print("  Normal-white SMC telemetry restored.")
     if let experimentError { throw experimentError }
 }
 // Research-only Intel brightness candidate. LSLB is the historical "Full On"
@@ -439,10 +426,9 @@ func run() throws {
     } else {
         customLevel = nil
     }
-    let standardModes = ["--test-off", "--test-on", "--test-amber", "--test-amber-fw0",
-                         "--test-amber-fw1", "--test-amber-blink", "--test-amber-double",
-                         "--test-full-dim", "--test-low-dim", "--test-very-low-dim",
-                         "--test-mid-dim", "--suite"]
+    let standardModes = ["--test-off", "--test-on", "--test-white-blink",
+                         "--test-white-double", "--test-full-dim", "--test-low-dim",
+                         "--test-very-low-dim", "--test-mid-dim", "--suite"]
     let standardTest = args.count == 2 && args[1] == "--confirm-hardware-test" &&
                        standardModes.contains(args[0])
     guard modelID() == "Macmini8,1" else { throw TestError("Only Macmini8,1 is supported") }
@@ -478,13 +464,9 @@ func run() throws {
             try testFullBrightnessCandidate(smc, cancellation: cancellation,
                                             candidate: [level, level], allowCustom: true)
         }
-    } else if ["--test-amber", "--test-amber-fw0", "--test-amber-fw1",
-        "--test-amber-blink", "--test-amber-double"].contains(args[0]) {
-        let candidates: [String: UInt8] = [
-            "--test-amber": 4, "--test-amber-fw0": 0, "--test-amber-fw1": 1,
-            "--test-amber-blink": 8, "--test-amber-double": 9
-        ]
-        try testAmberCandidate(smc, candidate: candidates[args[0]]!, cancellation: cancellation)
+    } else if args[0] == "--test-white-blink" || args[0] == "--test-white-double" {
+        try testWhiteBlink(smc, mode: args[0] == "--test-white-blink" ? 8 : 9,
+                           cancellation: cancellation)
     } else if ["--test-full-dim", "--test-low-dim",
                "--test-very-low-dim", "--test-mid-dim"].contains(args[0]) {
         let candidateByCommand: [String: [UInt8]] = [
