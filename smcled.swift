@@ -670,12 +670,33 @@ func siliconFadeBrightness(_ target: UInt8, duration explicitDuration: TimeInter
 
 func setManualWhiteBrightness(_ brightness: UInt8, noFade: Bool) throws {
     if modelID() == "Macmini8,1" {
+        // Intel needs software fade (LSLB updates have no built-in easing).
         try intelSetBrightness(brightness, noFade: noFade)
-    } else if noFade {
-        try setKnownLEDBrightness(brightness)
     } else {
-        try siliconFadeBrightness(brightness, selectMode: .white)
+        // Preserve the existing *native* Apple Silicon behavior. Its white
+        // channel can smooth a single LSLN write in hardware. Don't layer
+        // a second software fade on every ordinary command.
+        try setKnownLEDBrightness(brightness)
     }
+}
+
+// An explicit --fade on Apple Silicon without a duration should also use a
+// single native SMC write, preserving the currently selected color channel.
+// A timed request is opt-in to smcled's software interpolation instead.
+func siliconNativeCurrentChannelBrightness(_ level: UInt8) throws {
+    try requireRoot()
+    let smc = try SMC()
+    try requireSupportedLEDHost(smc: smc)
+    try checkLEDKeys(smc, includeModes: true)
+    let channel = try smc.read("LSCS")
+    guard channel == [0] || channel == [1] else {
+        throw ToolError("Cannot set native brightness: unknown LED channel")
+    }
+    try smc.write("LSLN", bytes: [level, level])
+    guard try smc.read("LSLN") == [level, level] else {
+        throw ToolError("Native brightness write did not return expected LSLN")
+    }
+    print("Native LED brightness set to \(level)/255 (current channel).")
 }
 
 // Physically validated on one Macmini8,1 (T2, bridgeOS 24P6005):
@@ -2291,9 +2312,10 @@ func usage() {
       sudo smcled --off                  Turn LED off (white brightness 0)
       sudo smcled --reset                Default white brightness (255)
       sudo smcled --intel-brightness 50  Intel 2018: custom white brightness 0...255 (experimental)
-      sudo smcled --fade 50 [seconds]     Fade current LED channel to 50 (both architectures)
-                                          Default: abs(level change)/255 seconds
-      sudo smcled 50 --no-fade           Immediate change, without smoothing
+      sudo smcled --fade 50 [seconds]     Intel: proportional software fade (0->255 takes 1s)
+                                          Apple Silicon: native channel write when seconds omitted
+                                          Explicit seconds: timed software fade on either architecture
+      sudo smcled 50 --no-fade           Intel: bypass software fade (Apple Silicon already native)
       sudo smcled --intel-full           Intel 2018: force full-bright white
       sudo smcled --intel-restore        Intel 2018: return to system-controlled white
       smcled --intel-led-status          Intel 2018: read-only SIL state
@@ -2431,8 +2453,13 @@ func run(_ originalArguments: [String]) throws {
         }
         if modelID() == "Macmini8,1" {
             try intelFadeBrightness(level, duration: duration)
-        } else {
+        } else if let duration {
+            // Explicit duration is an explicit request for software easing.
             try siliconFadeBrightness(level, duration: duration)
+        } else {
+            // Default is Apple's native one-write LED behavior, not an
+            // additional software fade layered over firmware smoothing.
+            try siliconNativeCurrentChannelBrightness(level)
         }
         return
     case "--intel-brightness":
@@ -2588,10 +2615,8 @@ func run(_ originalArguments: [String]) throws {
         }
         let brightness = try arguments.count == 2 ? brightnessNumber(arguments[1]) : nil
         let mode: LEDMode = command == "--amber" ? .amber : (command == "--amber-blink" ? .amberBlink : .amberDouble)
-        if mode == .amber, let brightness, !noFade {
-            try siliconFadeBrightness(brightness, selectMode: .amber)
-            return
-        }
+        // Preserve Apple Silicon's verified native amber/white behavior.
+        // No new fade loop for standard manual color commands.
         let smc = try SMC()
         try applyKnownLED(smc, mode: mode, brightness: brightness)
         print("Applied \(mode.rawValue) LED behavior\(brightness.map { " at brightness \($0)" } ?? ""); boot preference unchanged.")
@@ -2627,8 +2652,8 @@ func run(_ originalArguments: [String]) throws {
     default: break
     }
 
-    // A bare number is a non-persistent white brightness change, faded by
-    // default with duration proportional to the level difference.
+    // Bare brightness uses the Intel proportional software fade; Apple
+    // Silicon retains its original native single-write behavior.
     // --install is the explicit way to change the saved boot preference.
     if command.allSatisfy({ $0 >= "0" && $0 <= "9" }) {
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled <0...255>") }
