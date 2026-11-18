@@ -218,6 +218,14 @@ func readCompatibilityKeys(_ smc: SMC) -> [String: KeyInfo] {
 func reportCompatibility() throws {
     let smc = try SMC()
     let model = modelID()
+    if model == "Macmini8,1" {
+        print("Mac model: \(model)")
+        print("SMC LED interface: Intel T2 (off/full-white/normal-white physically verified on one unit)")
+        print("  Available: --off, --intel-full, --reset, --intel-restore, --white (without brightness)")
+        print("  Installation, intermediate brightness, and amber/color commands remain blocked.")
+        try intelSILStatus()
+        return
+    }
     let keys = readCompatibilityKeys(smc)
     let level = compatibilityLevel(model, keys)
     print("Mac model: \(model)")
@@ -534,6 +542,120 @@ func setKnownLEDBrightness(_ brightness: UInt8) throws {
     try requireSupportedLEDHost()
     let smc = try SMC()
     try applyKnownLED(smc, mode: .white, brightness: brightness)
+}
+
+// Physically validated on one Macmini8,1 (T2, bridgeOS 24P6005):
+// LSOO=0 -> LED off, LSOF=01, LSPV=00 00.
+// LSOO=1 -> visibly full-bright white, LSPV=6B 08.
+// LSRB=0 -> fades to normal white, LSPV=14 11, LSOF=00.
+// This is an *independent* Intel protocol. No LSLN brightness values,
+// Apple Silicon amber presets, or boot-time installations are enabled here.
+// Conservative fingerprints restrict writes to the tested hardware state.
+enum IntelSILState {
+    case off, full, normal
+}
+
+func checkIntelSIL(_ smc: SMC) throws {
+    try requireRoot()
+    guard modelID() == "Macmini8,1" else {
+        throw ToolError("Intel SIL controls are restricted to Macmini8,1")
+    }
+    let required: [(String, UInt32, String, Bool, Bool)] = [
+        ("LSOO", 1, "flag", false, true),
+        ("LSRB", 1, "flag", false, true),
+        ("LSPV", 2, "ui16", true, false),
+        ("LSOF", 1, "flag", true, false),
+        ("LSLN", 2, "ui16", true, true),
+        ("LSSV", 2, "ui16", true, true),
+        ("LS! ", 1, "ui8 ", true, true)
+    ]
+    for (key, size, type, readable, writable) in required {
+        let info = try smc.info(key)
+        guard info.size == size && info.type == type &&
+              info.readable == readable && info.writable == writable else {
+            throw ToolError("Unexpected Intel SMC key metadata for \(key); refusing write")
+        }
+    }
+    // Exact state observed during physical tests. Fail closed on different
+    // T2 firmware/hardware until the variation is separately investigated.
+    guard try smc.read("LSLN") == [0x2F, 0xFF],
+          try smc.read("LSSV") == [0x08, 0x6B],
+          try smc.read("LS! ") == [0x00] else {
+        throw ToolError("Intel SIL calibration differs from the tested unit; refusing write")
+    }
+}
+
+// Unlike a brightness override, these commands are not temporary:
+// the user explicitly selects the new state, and --reset/--intel-restore
+// restores firmware-controlled brightness. No LaunchDaemon is installed.
+func applyIntelSIL(_ state: IntelSILState) throws {
+    let smc = try SMC()
+    try checkIntelSIL(smc)
+    let off = try smc.read("LSOF")
+    let initialPWM = try smc.read("LSPV")
+    let normalPWM: [UInt8] = [0x14, 0x11]
+    let fullPWM: [UInt8] = [0x6B, 0x08]
+    guard (off == [1] && initialPWM == [0, 0]) ||
+          (off == [0] && (initialPWM == normalPWM || initialPWM == fullPWM)) else {
+        throw ToolError("Intel SIL is not at a verified stable state (LSOF=\(hex(off)), LSPV=\(hex(initialPWM))); wait for any fade and retry")
+    }
+    let target: [UInt8]
+    let targetOff: [UInt8]
+    let command: String
+    switch state {
+    case .off:
+        target = [0, 0]; targetOff = [1]; command = "LSOO"
+        if initialPWM == target && off == targetOff {
+            print("Intel SIL already off."); return
+        }
+    case .full:
+        target = fullPWM; targetOff = [0]; command = "LSOO"
+        if initialPWM == target && off == targetOff {
+            print("Intel SIL already at verified full brightness."); return
+        }
+    case .normal:
+        target = normalPWM; targetOff = [0]; command = "LSRB"
+        if initialPWM == target && off == targetOff {
+            print("Intel SIL already at normal firmware brightness."); return
+        }
+    }
+    let payload: [UInt8] = state == .full ? [1] : [0]
+    try smc.write(command, bytes: payload)
+    let deadline = Date().addingTimeInterval(state == .normal ? 6.0 : 2.0)
+    var observedPWM: [UInt8] = []
+    var observedOff: [UInt8] = []
+    repeat {
+        observedPWM = try smc.read("LSPV")
+        observedOff = try smc.read("LSOF")
+        if observedPWM == target && observedOff == targetOff {
+            print("Intel SIL state confirmed: \(state == .off ? "off" : state == .full ? "full white" : "normal white") " +
+                  "(LSPV=\(hex(observedPWM)), LSOF=\(hex(observedOff))).")
+            print("Not persistent; no boot setting or daemon changed.")
+            return
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+    } while Date() < deadline
+    // On a failed LSOO attempt, try to return to known normal behavior.
+    // Do not send another LSRB when normal restoration is already fading.
+    if command == "LSOO" {
+        do { try smc.write("LSRB", bytes: [0]) }
+        catch { writeStderr("WARNING: emergency LSRB restore failed: \(error)\n") }
+    }
+    throw ToolError("Intel SIL transition not confirmed (LSOF=\(hex(observedOff)), LSPV=\(hex(observedPWM))); inspect the physical LED and allow the fade to finish")
+}
+
+func intelSILStatus() throws {
+    guard modelID() == "Macmini8,1" else {
+        throw ToolError("Intel SIL status is available on Macmini8,1 only")
+    }
+    let smc = try SMC()
+    print("Intel Mac mini 2018 SIL, read-only (actual hardware state must be checked visually):")
+    for key in ["LSLN", "LSLB", "LSLF", "LSPV", "LSSV", "LSOF", "LS! ", "LSB!"] {
+        let value = (try? smc.read(key)).map(hex) ?? "unavailable"
+        print("  \(key): \(value)")
+    }
+    print("Off, full-white and normal-white transitions were physically verified on one Macmini8,1.")
+    print("Intermediate brightness, amber, and sleep/wake persistence remain unverified.")
 }
 
 // Reject symlinks and unexpected ownership in privileged file destinations.
@@ -1792,6 +1914,11 @@ func usage() {
                                           Double amber flashing
       sudo smcled --off                  Turn LED off (white brightness 0)
       sudo smcled --reset                Default white brightness (255)
+      sudo smcled --intel-full           Intel 2018: force full-bright white
+      sudo smcled --intel-restore        Intel 2018: return to system-controlled white
+      smcled --intel-led-status          Intel 2018: read-only SIL state
+      # Intel 2018: --off turns LED off; --reset or --white restores
+      # Intel 2018: 0–255 brightness, amber, and installation remain disabled
 
       sudo smcled --install 10           Persist white brightness 10
       sudo smcled --install white 10     Persist white brightness 10
@@ -1886,6 +2013,15 @@ func run(_ originalArguments: [String]) throws {
     case "--compatibility":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility") }
         try reportCompatibility()
+        return
+    case "--intel-led-status":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-led-status") }
+        try intelSILStatus()
+        return
+    case "--intel-full", "--intel-restore", "--intel-off":
+        guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled \(command)") }
+        try applyIntelSIL(command == "--intel-full" ? .full :
+                          command == "--intel-restore" ? .normal : .off)
         return
     case "--intel-snapshot":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-snapshot") }
@@ -1988,16 +2124,31 @@ func run(_ originalArguments: [String]) throws {
         return
     case "--off":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --off") }
+        if modelID() == "Macmini8,1" {
+            try applyIntelSIL(.off)
+            return
+        }
         try setKnownLEDBrightness(0)
         print("LED off; boot preference unchanged.")
         return
     case "--reset":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --reset") }
+        if modelID() == "Macmini8,1" {
+            try applyIntelSIL(.normal)
+            return
+        }
         try setKnownLEDBrightness(255)
         print("Restored normal white LED brightness (255); boot preference unchanged.")
         return
     case "--white":
         guard arguments.count == 1 || arguments.count == 2 else { throw ToolError("Usage: sudo smcled --white [0...255]") }
+        if modelID() == "Macmini8,1" {
+            guard arguments.count == 1 else {
+                throw ToolError("Intel 2018 supports --white without a brightness value; adjustable brightness is unverified")
+            }
+            try applyIntelSIL(.normal)
+            return
+        }
         let brightness = try arguments.count == 2 ? brightnessNumber(arguments[1]) : nil
         let smc = try SMC()
         try applyKnownLED(smc, mode: .white, brightness: brightness)
