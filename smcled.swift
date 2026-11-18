@@ -324,6 +324,27 @@ func compatibilitySelfTest() throws {
         throw ToolError("Intel LSLN byte-selection self-test failed")
     }
     print("PASS: Intel byte-selection logic preserves the other byte")
+    // Pure arithmetic checks against physically measured Intel PWM points.
+    let intelPoints: [([UInt8], Int)] = [
+        ([0x00, 0x00], 0),
+        ([0x08, 0x00], 0x0358),
+        ([0x10, 0x00], 0x06B0),
+        ([0x20, 0x00], 0x0D61),
+        ([0x7F, 0xFF], 0x3584),
+        ([0xFF, 0xFF], 0x6B08)
+    ]
+    for (preset, measuredPWM) in intelPoints {
+        let calculated = intelPWMExpected(preset)
+        guard abs(calculated - measuredPWM) <= 3 else {
+            throw ToolError("Intel PWM estimation self-test failed: LSLB=\\(hex(preset)), expected ~\\(measuredPWM), got \\(calculated)")
+        }
+    }
+    guard intelPWMExpected([0x00, 0x00]) == 0,
+          intelPWMExpected([0xFF, 0xFF]) == 0x6B08,
+          intelPWMExpected([50, 50]) > intelPWMExpected([16, 16]) else {
+        throw ToolError("Intel 0...255 level scaling self-test failed")
+    }
+    print("PASS: Intel 0...255 PWM mapping matches hardware samples within 3 counts")
     guard looksLikeModernMacIdentifier("Mac17,9"),
           looksLikeModernMacIdentifier("Mac27,12"),
           !looksLikeModernMacIdentifier("Macmini8,1"),
