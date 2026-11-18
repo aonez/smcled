@@ -369,6 +369,21 @@ func compatibilitySelfTest() throws {
         }
     }
     print("PASS: Intel 16-bit fade endpoints and monotonic steps")
+    let timings: [(Double, Double, Double)] = [
+        (0, 255, 1), (10, 20, 10.0 / 255),
+        (10, 200, 190.0 / 255), (200, 10, 190.0 / 255),
+        (1, 1, 0)
+    ]
+    for (start, end, expected) in timings {
+        guard abs(proportionalFadeSeconds(from: start, to: end) - expected) < 0.000001 else {
+            throw ToolError("Proportional fade timing self-test failed: \(start) -> \(end)")
+        }
+    }
+    guard fadeStepCount(for: 10.0 / 255) >= 1,
+          fadeStepCount(for: 1) <= 180 else {
+        throw ToolError("Proportional fade step count self-test failed")
+    }
+    print("PASS: Relative one-second full-range fade timing")
     guard looksLikeModernMacIdentifier("Mac17,9"),
           looksLikeModernMacIdentifier("Mac27,12"),
           !looksLikeModernMacIdentifier("Macmini8,1"),
@@ -589,6 +604,80 @@ func setKnownLEDBrightness(_ brightness: UInt8) throws {
     try applyKnownLED(smc, mode: .white, brightness: brightness)
 }
 
+// Manual white and steady-amber fades on Apple Silicon. This intentionally
+// keeps the installed solar scheduler's existing three-second timing intact.
+// --fade <level> preserves the active channel; ordinary white commands select
+// white, fading through darkness if switching from amber.
+func siliconFadeBrightness(_ target: UInt8, duration explicitDuration: TimeInterval? = nil,
+                           selectMode: LEDMode? = nil) throws {
+    if let explicitDuration {
+        guard explicitDuration.isFinite, (0.01...15.0).contains(explicitDuration) else {
+            throw ToolError("Fade duration must be between 0.01 and 15 seconds")
+        }
+    }
+    try requireRoot()
+    let smc = try SMC()
+    try requireSupportedLEDHost(smc: smc)
+    try checkLEDKeys(smc, includeModes: true)
+    let current = try smc.read("LSLN")
+    guard current.count == 2, current[0] == current[1] else {
+        throw ToolError("Apple Silicon LED brightness is not a symmetric ui16 value; refusing fade")
+    }
+    let activeChannel = try smc.read("LSCS")
+    guard activeChannel == [0] || activeChannel == [1] else {
+        throw ToolError("Apple Silicon LED is not on a recognized white/amber channel")
+    }
+    // A regular brightness command chooses white, but an explicit --fade
+    // without a mode preserves the current white/amber channel.
+    let desiredChannel: UInt8 = selectMode == .white ? 0 :
+                               selectMode == .amber ? 1 : activeChannel[0]
+    let start = current[0]
+    if desiredChannel == activeChannel[0] {
+        let duration = explicitDuration ??
+            proportionalFadeSeconds(from: Double(start), to: Double(target))
+        if start == target { return }
+        try fadeBrightness(smc, from: start, to: target, duration: duration,
+                           steps: fadeStepCount(for: duration))
+    } else {
+        // Channel switch: fade the old channel down, switch while dark, then
+        // fade the selected channel up. This is the proven auto-mode path.
+        let outDuration = explicitDuration.map { $0 / 2 } ??
+            proportionalFadeSeconds(from: Double(start), to: 0)
+        let inDuration = explicitDuration.map { $0 / 2 } ??
+            proportionalFadeSeconds(from: 0, to: Double(target))
+        if start > 0 {
+            try fadeBrightness(smc, from: start, to: 0, duration: outDuration,
+                               steps: fadeStepCount(for: outDuration))
+        } else {
+            try smc.write("LSLN", bytes: [0, 0])
+        }
+        if desiredChannel == 0 { try restoreWhiteChannel(smc) }
+        else { try smc.write("LSSB", bytes: [4, 0]) }
+        try smc.write("LSLN", bytes: [0, 0])
+        if target > 0 {
+            try fadeBrightness(smc, from: 0, to: target, duration: inDuration,
+                               steps: fadeStepCount(for: inDuration))
+        }
+    }
+    let final = try smc.read("LSLN")
+    guard final == [target, target],
+          try smc.read("LSCS") == [desiredChannel] else {
+        throw ToolError("Apple Silicon brightness fade did not reach the target channel/level")
+    }
+    print("LED brightness faded to \(target)/255" +
+          (selectMode.map { " in \($0.rawValue) mode" } ?? " (current channel)"))
+}
+
+func setManualWhiteBrightness(_ brightness: UInt8, noFade: Bool) throws {
+    if modelID() == "Macmini8,1" {
+        try intelSetBrightness(brightness, noFade: noFade)
+    } else if noFade {
+        try setKnownLEDBrightness(brightness)
+    } else {
+        try siliconFadeBrightness(brightness, selectMode: .white)
+    }
+}
+
 // Physically validated on one Macmini8,1 (T2, bridgeOS 24P6005):
 // LSOO=0 -> LED off, LSOF=01, LSPV=00 00.
 // LSOO=1 -> visibly full-bright white, LSPV=6B 08.
@@ -794,15 +883,29 @@ func intelWriteBrightness(_ level: UInt8) throws {
 // needs multiple software-paced SMC writes, not one special firmware command.
 // Use the full 16-bit LSLB range for fine steps, particularly below 10/255.
 // This method is intentionally opt-in; immediate brightness stays immediate.
+// A full 0 -> 255 brightness change lasts 1 second; all other changes
+// take the corresponding fraction, on both Apple Silicon and Intel.
+func proportionalFadeSeconds(from start: Double, to end: Double) -> TimeInterval {
+    abs(end - start) / 255.0
+}
+
+func fadeStepCount(for duration: TimeInterval) -> Int {
+    // Never impose a minimum duration on short transitions. SMC transport
+    // overhead may still exceed the requested time for changes of 1-2 units.
+    max(1, min(180, Int((duration * 60.0).rounded())))
+}
+
 func intelFadePreset(from start: Int, to end: Int, step: Int, steps: Int) -> Int {
     let t = Double(step) / Double(steps)
     let eased = t * t * (3.0 - 2.0 * t)
     return max(0, min(65535, Int((Double(start) + Double(end - start) * eased).rounded())))
 }
 
-func intelFadeBrightness(_ level: UInt8, duration: TimeInterval = 3.0) throws {
-    guard duration.isFinite, (0.5...15.0).contains(duration) else {
-        throw ToolError("Intel fade duration must be between 0.5 and 15 seconds")
+func intelFadeBrightness(_ level: UInt8, duration explicitDuration: TimeInterval? = nil) throws {
+    if let explicitDuration {
+        guard explicitDuration.isFinite, (0.01...15.0).contains(explicitDuration) else {
+            throw ToolError("Fade duration must be between 0.01 and 15 seconds")
+        }
     }
     let smc = try SMC()
     try checkIntelSIL(smc)
@@ -817,6 +920,9 @@ func intelFadeBrightness(_ level: UInt8, duration: TimeInterval = 3.0) throws {
                     (currentPreset != intelDefaultLSLB || currentPWM != intelNormalPWM)
     let start = wasOff ? 0 : (wasManual ? intelUnsigned16(currentPreset) : 0x2FFF)
     let target = Int(level) * 257
+    let duration = explicitDuration ??
+        proportionalFadeSeconds(from: Double(start) / 257.0,
+                                to: Double(level))
 
     if (wasOff && level == 0) || (wasManual && start == target) {
         print("Intel fade: requested brightness already active.")
@@ -824,7 +930,7 @@ func intelFadeBrightness(_ level: UInt8, duration: TimeInterval = 3.0) throws {
     }
 
     let cancellation = DiagnosticCancellation()
-    let steps = max(20, min(120, Int((duration * 30).rounded())))
+    let steps = fadeStepCount(for: duration)
     var activeOverride = wasManual
     var lastPreset = currentPreset
     let beginning = Date()
@@ -891,12 +997,19 @@ func intelFadeBrightness(_ level: UInt8, duration: TimeInterval = 3.0) throws {
     }
 }
 
-func applyIntelSIL(_ state: IntelSILState) throws {
+// Shared manual brightness entry: smooth relative-time fades by default,
+// while --no-fade keeps instant writes available when explicitly requested.
+func intelSetBrightness(_ level: UInt8, noFade: Bool = false) throws {
+    if noFade { try intelWriteBrightness(level) }
+    else { try intelFadeBrightness(level) }
+}
+
+func applyIntelSIL(_ state: IntelSILState, noFade: Bool = false) throws {
     switch state {
     case .full:
-        try intelWriteBrightness(255)
+        try intelSetBrightness(255, noFade: noFade)
     case .off:
-        try intelWriteBrightness(0)
+        try intelSetBrightness(0, noFade: noFade)
     case .normal:
         let smc = try SMC()
         try checkIntelSIL(smc)
@@ -2178,13 +2291,15 @@ func usage() {
       sudo smcled --off                  Turn LED off (white brightness 0)
       sudo smcled --reset                Default white brightness (255)
       sudo smcled --intel-brightness 50  Intel 2018: custom white brightness 0...255 (experimental)
-      sudo smcled --intel-fade 50 [seconds]
-                                          Intel 2018: smooth 16-bit fade (default 3s)
+      sudo smcled --fade 50 [seconds]     Fade current LED channel to 50 (both architectures)
+                                          Default: abs(level change)/255 seconds
+      sudo smcled 50 --no-fade           Immediate change, without smoothing
       sudo smcled --intel-full           Intel 2018: force full-bright white
       sudo smcled --intel-restore        Intel 2018: return to system-controlled white
       smcled --intel-led-status          Intel 2018: read-only SIL state
       # Intel 2018: --off turns LED off; --reset or --white restores
       # Intel 2018: --white 50 or bare 50 also sets custom white level
+      # Manual brightness commands fade by default; --no-fade opts out
       # Intel 2018: amber and installation remain disabled
 
       sudo smcled --install 10           Persist white brightness 10
@@ -2272,8 +2387,22 @@ func ledBytes(_ value: UInt8, mode: String) -> [UInt8] {
 }
 
 func run(_ originalArguments: [String]) throws {
-    let arguments = originalArguments.filter { $0 != "--accept-untested-model" }
+    let noFade = originalArguments.contains("--no-fade")
+    let arguments = originalArguments.filter {
+        $0 != "--accept-untested-model" && $0 != "--no-fade"
+    }
     guard let command = arguments.first else { usage(); return }
+    if noFade {
+        let isNumeric = !command.isEmpty && command.allSatisfy({ $0 >= "0" && $0 <= "9" })
+        let valid = isNumeric || command == "--intel-brightness" ||
+                    command == "--intel-full" || command == "--intel-off" ||
+                    command == "--off" || command == "--reset" ||
+                    (command == "--white" && arguments.count == 2) ||
+                    (command == "--amber" && arguments.count == 2)
+        guard valid else {
+            throw ToolError("--no-fade is only valid for manual brightness changes, not --fade or installation")
+        }
+    }
     if ["--help", "help", "-h"].contains(command) { usage(); return }
     if command == "model" { print(modelID()); return }
     switch command {
@@ -2285,37 +2414,39 @@ func run(_ originalArguments: [String]) throws {
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-led-status") }
         try intelSILStatus()
         return
-    case "--intel-fade":
+    case "--fade":
         guard arguments.count == 2 || arguments.count == 3 else {
-            throw ToolError("Usage: sudo smcled --intel-fade <0...255> [seconds]")
-        }
-        guard modelID() == "Macmini8,1" else {
-            throw ToolError("--intel-fade is only available on Macmini8,1")
+            throw ToolError("Usage: sudo smcled --fade <0...255> [seconds]")
         }
         let level = try brightnessNumber(arguments[1])
-        let duration: Double
+        let duration: Double?
         if arguments.count == 3 {
             guard let value = Double(arguments[2]), value.isFinite,
-                  (0.5...15.0).contains(value) else {
-                throw ToolError("Intel fade duration must be 0.5 to 15 seconds")
+                  (0.01...15.0).contains(value) else {
+                throw ToolError("Fade duration must be between 0.01 and 15 seconds")
             }
             duration = value
         } else {
-            duration = 3.0
+            duration = nil
         }
-        try intelFadeBrightness(level, duration: duration)
+        if modelID() == "Macmini8,1" {
+            try intelFadeBrightness(level, duration: duration)
+        } else {
+            try siliconFadeBrightness(level, duration: duration)
+        }
         return
     case "--intel-brightness":
         guard arguments.count == 2 else { throw ToolError("Usage: sudo smcled --intel-brightness <0...255>") }
         guard modelID() == "Macmini8,1" else {
             throw ToolError("--intel-brightness is only supported on Macmini8,1")
         }
-        try intelWriteBrightness(brightnessNumber(arguments[1]))
+        try intelSetBrightness(brightnessNumber(arguments[1]), noFade: noFade)
         return
     case "--intel-full", "--intel-restore", "--intel-off":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled \(command)") }
         try applyIntelSIL(command == "--intel-full" ? .full :
-                          command == "--intel-restore" ? .normal : .off)
+                          command == "--intel-restore" ? .normal : .off,
+                          noFade: noFade)
         return
     case "--intel-snapshot":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-snapshot") }
@@ -2418,43 +2549,49 @@ func run(_ originalArguments: [String]) throws {
         return
     case "--off":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --off") }
-        if modelID() == "Macmini8,1" {
-            try applyIntelSIL(.off)
-            return
-        }
-        try setKnownLEDBrightness(0)
+        try setManualWhiteBrightness(0, noFade: noFade)
         print("LED off; boot preference unchanged.")
         return
     case "--reset":
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled --reset") }
         if modelID() == "Macmini8,1" {
+            // --reset restores firmware-controlled brightness, not an 8-bit
+            // manual level. Its firmware transition already fades.
             try applyIntelSIL(.normal)
             return
         }
-        try setKnownLEDBrightness(255)
+        try setManualWhiteBrightness(255, noFade: noFade)
         print("Restored normal white LED brightness (255); boot preference unchanged.")
         return
     case "--white":
         guard arguments.count == 1 || arguments.count == 2 else { throw ToolError("Usage: sudo smcled --white [0...255]") }
-        if modelID() == "Macmini8,1" {
-            if arguments.count == 1 { try applyIntelSIL(.normal) }
-            else { try intelWriteBrightness(brightnessNumber(arguments[1])) }
+        if arguments.count == 2 {
+            try setManualWhiteBrightness(brightnessNumber(arguments[1]), noFade: noFade)
+            print("White brightness set; boot preference unchanged.")
             return
         }
-        let brightness = try arguments.count == 2 ? brightnessNumber(arguments[1]) : nil
+        if modelID() == "Macmini8,1" {
+            try applyIntelSIL(.normal)
+            return
+        }
+        let brightness: UInt8? = nil
         let smc = try SMC()
         try applyKnownLED(smc, mode: .white, brightness: brightness)
         print("Normal white LED restored\(brightness.map { " at brightness \($0)" } ?? ""); boot preference unchanged.")
         return
     case "--amber", "--amber-blink", "--amber-double":
         if modelID() == "Macmini8,1" {
-            throw ToolError("Macmini8,1 LED control is white-only; amber is not supported. Use --intel-fade, a white brightness command, or --reset.")
+            throw ToolError("Macmini8,1 LED control is white-only; amber is not supported. Use --fade, a white brightness command, or --reset.")
         }
         guard arguments.count == 1 || arguments.count == 2 else {
             throw ToolError("Usage: sudo smcled \(command) [0...255]")
         }
         let brightness = try arguments.count == 2 ? brightnessNumber(arguments[1]) : nil
         let mode: LEDMode = command == "--amber" ? .amber : (command == "--amber-blink" ? .amberBlink : .amberDouble)
+        if mode == .amber, let brightness, !noFade {
+            try siliconFadeBrightness(brightness, selectMode: .amber)
+            return
+        }
         let smc = try SMC()
         try applyKnownLED(smc, mode: mode, brightness: brightness)
         print("Applied \(mode.rawValue) LED behavior\(brightness.map { " at brightness \($0)" } ?? ""); boot preference unchanged.")
@@ -2490,17 +2627,14 @@ func run(_ originalArguments: [String]) throws {
     default: break
     }
 
-    // A bare number is an immediate, non-persistent brightness change.
+    // A bare number is a non-persistent white brightness change, faded by
+    // default with duration proportional to the level difference.
     // --install is the explicit way to change the saved boot preference.
     if command.allSatisfy({ $0 >= "0" && $0 <= "9" }) {
         guard arguments.count == 1 else { throw ToolError("Usage: sudo smcled <0...255>") }
         let brightness = try brightnessNumber(command)
-        if modelID() == "Macmini8,1" {
-            try intelWriteBrightness(brightness)
-        } else {
-            try setKnownLEDBrightness(brightness)
-            print("LED brightness set to \(brightness) (\(hex([brightness, brightness]))). Saved boot preference, if installed, was not changed.")
-        }
+        try setManualWhiteBrightness(brightness, noFade: noFade)
+        print("LED brightness set to \(brightness). Saved boot preference, if installed, was not changed.")
         return
     }
 
