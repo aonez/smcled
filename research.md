@@ -779,3 +779,31 @@ Intel `Macmini8,1` user physically verified the previous `--intel-fade` smoothst
 **Apple Silicon behavior is deliberately preserved.** The M1 Mac mini previously showed perceptible smoothing of white LED brightness on individual `LSLN` writes, which suggests native hardware/firmware easing. Its existing 3-second automatic sunrise/sunset transitions are separate **software fades** (`fadeBrightness` writes intermediate `LSLN` values). Ordinary Apple Silicon manual brightness and amber commands keep using their prior single-write/control-channel path. When `--fade <level>` has no explicit duration, Apple Silicon also performs a native single write on the current channel. `--fade <level> <seconds>` explicitly opts into smcled-managed software easing. Do not claim Apple Silicon's hardware smoothing is fully characterized on every LED color/mode, and do not attempt to suppress it using `--no-fade`.
 
 The existing sunrise/sunset automatic scheduler is **unchanged** on Apple Silicon. Intel white-only automatic mode has **not** been enabled; it requires separate white-only schedule choices, installation/startup behavior and wake/recovery tests. This implementation is on the Intel feature branch only, not `main`.
+
+## 18 November 2026 — Intel white-only sunrise/sunset auto implementation
+
+The user physically confirmed the experimental Intel smoothstep software fade and the later proportional fade behavior. The existing Apple Silicon auto schedule is reused on the Intel 2018 Mac mini (`Macmini8,1`) **without altering event times or brightness levels**, but **all Intel output stays white**:
+
+| Solar event | Intel output |
+|---|---|
+| Sunrise − 1 hour | white 100 |
+| Sunrise | white 33 |
+| Sunrise + 1 hour | white 255 |
+| Sunset | white 100 |
+| Sunset + 1 hour | white 255 |
+| Sunset + 4 hours (or +3h for late sunsets) | white 33 |
+
+The `effectiveAutomaticMode` mapping affects preview and the Intel auto application only; existing Apple Silicon white/amber transitions and 3-second fades are preserved.
+
+Intel auto application verifies the same model-specific SMC metadata and calibration as the physically tested manual Intel path. It reads the existing solar schedule and calls the previously tested proportional `intelFadeBrightness` using the existing SMC connection. It **never** writes `LSSB` or selects an amber channel. When already at the desired steady brightness, the fade helper returns without changing SMC settings.
+
+Supported Intel workflow:
+- `./smcled --auto-preview`: read-only, reports white-only Intel plan
+- `sudo ./smcled --auto-check`: apply current white-only solar target once
+- `sudo ./smcled --install-auto [interval]`: install a root-owned one-shot LaunchDaemon (RunAtLoad + StartInterval; 300 seconds by default)
+- `./smcled --status`: report auto preference, launchd status and white-only profile
+- `sudo smcled --uninstall`: boot out the LaunchDaemon, delete managed files, and restore the Intel system-controlled normal white (`LSRB`, then `LSLB=FF FF`)
+
+**Intel fixed-mode installation is deliberately blocked**, and the LaunchDaemon refuses to apply a fixed-mode preference on Intel. Intel amber commands are unsupported. Existing Apple Silicon `--install-auto`, fixed installation and auto mode are unchanged.
+
+The code was committed to the feature branch with an offline white-only plan-mapping self-test. **Intel auto installation, reboot/wake recovery and uninstall still need on-device confirmation**; successful manual PWM and fade tests alone do not establish that launchd initialization or scheduled checks will work on this firmware.
