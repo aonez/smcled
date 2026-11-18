@@ -1211,6 +1211,10 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     let smc = try SMC()
     if intel {
         try checkIntelSIL(smc)
+        // A blinking/fading or unknown state could prevent the first auto
+        // transition. Refuse the installation before modifying any root-owned
+        // files, so the user can restore normal white and retry safely.
+        _ = try intelStableState(smc)
     } else {
         try requireSupportedLEDHost(smc: smc)
         try checkLEDKeys(smc, includeModes: true)
