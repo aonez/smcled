@@ -19,3 +19,6 @@ jobs:
         run: ./smcled --compatibility-self-test
       - name: Verify CLI help
         run: ./smcled --help
+      - name: Check help lines fit a standard Terminal
+        run: |
+          ./smcled --help | awk 'length($0) > 96 { printf "Help line %d too wide (%d columns)\\n", NR, length($0); bad=1 } END { exit bad }'
