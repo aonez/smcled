@@ -782,7 +782,7 @@ The existing sunrise/sunset automatic scheduler is **unchanged** on Apple Silico
 
 ## 18 November 2026 — Intel white-only sunrise/sunset auto implementation
 
-The user physically confirmed the experimental Intel smoothstep software fade and the later proportional fade behavior. The existing Apple Silicon auto schedule is reused on the Intel 2018 Mac mini (`Macmini8,1`) **without altering event times or brightness levels**, but **all Intel output stays white**:
+The user physically confirmed the experimental Intel smoothstep software fade and the later proportional fade behavior. Historical implementation note: The first Intel auto prototype reused the Apple Silicon transition schedule with all colors mapped to white. This has now been superseded by the independent seven-event Intel schedule detailed below.
 
 | Solar event | Intel output |
 |---|---|
@@ -807,3 +807,21 @@ Supported Intel workflow:
 **Intel fixed-mode installation is deliberately blocked**, and the LaunchDaemon refuses to apply a fixed-mode preference on Intel. Intel amber commands are unsupported. Existing Apple Silicon `--install-auto`, fixed installation and auto mode are unchanged.
 
 The code was committed to the feature branch with an offline white-only plan-mapping self-test. **Intel auto installation, reboot/wake recovery and uninstall still need on-device confirmation**; successful manual PWM and fade tests alone do not establish that launchd initialization or scheduled checks will work on this firmware.
+
+## 18 November 2026 — Revised Intel white-only automatic schedule (supersedes six-stage Intel prototype)
+
+The user specified a distinct seven-event brightness progression for the 2018 Intel Mac mini. Apple Silicon retains its original six-event white/amber plan. Both use the existing solar calculation and late-sunset cutoff (sunset hour at least 21 => final event after three hours instead of four).
+
+| Event | Intel `Macmini8,1` | Apple Silicon (unchanged) |
+|---|---|---|
+| Sunrise − 1 h | white 33 | amber 100 |
+| Sunrise | white 50 | white 33 |
+| Sunrise + 1 h | white 100 | white 255 |
+| Sunrise + 2 h | white 255 | no new event |
+| Sunset | white 100 | white 100 |
+| Sunset + 1 h | white 50 | amber 255 |
+| Sunset + 4 h (or +3 h late) | white 33 | amber 33 |
+
+`automaticTransitions(for:calendar:model:)` selects the architecture-specific schedule, and `calculateAutoPlan` builds the complete event list from those transitions. Both `--auto-preview` and `--auto-check` therefore use the same actual target rather than transforming only color labels. Offline self-tests assert exact Intel event count/brightness/mode/time, the original Apple Silicon schedule and the late-sunset three-hour behavior.
+
+Only the feature branch has been changed. The user's Intel Mac already confirmed manual brightness and fades, but the new seven-stage automatic plan still needs on-device preview, manual check and launchd verification.
