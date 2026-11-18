@@ -1185,6 +1185,15 @@ func validateCLIParents(create: Bool) throws -> Bool {
     return true
 }
 
+// The PATH entry is OPTIONAL. /usr/local/bin is often owned by a Homebrew
+// user on Intel Macs and is not a safe directory for a privileged executable
+// name: a non-root user could replace the symlink before "sudo smcled" runs.
+// Skip it rather than chown/chmod a directory managed by another program.
+// launchd always executes the root-owned installedExecutable by absolute path.
+func canManageCLILink() -> Bool {
+    (try? validateCLIParents(create: false)) == true
+}
+
 func installCLILink() throws {
     _ = try validateCLIParents(create: true)
     guard !(try validateCLILink()) else { return }
@@ -1274,11 +1283,11 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     let _ = try validateManagedPath(brightnessPreference, directory: false)
     let _ = try validateManagedPath(modePreference, directory: false)
     let _ = try validateManagedPath(daemonPlist, directory: false)
-    // Validate the PATH destination before stopping any existing service.
-    // If /usr/local or /usr/local/bin already exists, it must be root-owned
-    // and not writable by other users.
-    let _ = try validateCLIParents(create: false)
-    let _ = try validateCLILink()
+    // The CLI symlink is optional and must NOT prevent auto installation.
+    // Many Intel Macs use a user-owned Homebrew /usr/local/bin. Do not
+    // change its ownership/permissions or place a trusted sudo command there.
+    let manageCLILink = canManageCLILink()
+    if manageCLILink { _ = try validateCLILink() }
 
     // A reload is needed if the binary or plist changes.
     if jobIsLoaded() {
@@ -1296,7 +1305,7 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     let needsExperimentalAcknowledgment = !intel && !physicallyTestedDesktops.contains(modelID())
     try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval,
                                                           acknowledged: needsExperimentalAcknowledgment))
-    try installCLILink()
+    if manageCLILink { try installCLILink() }
     // A previously disabled service must be re-enabled explicitly.
     _ = try callLaunchctl(["enable", "system/" + jobLabel])
     _ = try callLaunchctl(["bootstrap", "system", daemonPlist])
@@ -1308,7 +1317,13 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
           ? "Installed \(jobLabel); \(intel ? "Intel white-only" : "white/amber") automatic sunrise/sunset mode (every \(interval) seconds)."
           : "Installed \(jobLabel); saved mode \(mode.rawValue), brightness \(brightness).")
     print("Boot-time job: \(daemonPlist)")
-    print("Shell command: \(cliLink) (sudo required to write)")
+    if manageCLILink {
+        print("Shell command: \(cliLink) (sudo required to write)")
+    } else {
+        print("PATH symlink skipped: \(cliBinDirectory) is absent or not a trusted root-owned directory.")
+        print("Use the installed executable: sudo \"\(installedExecutable)\" <command>")
+        print("Do not change ownership of \(cliBinDirectory) just to install smcled.")
+    }
 }
 
 func readInstalledBrightness() throws -> UInt8 {
@@ -1398,8 +1413,9 @@ func uninstallBrightness() throws {
         }
     }
     let _ = try validateManagedPath(daemonPlist, directory: false)
-    let hasCLILink = try validateCLILink()
-    if hasCLILink { _ = try validateCLIParents(create: false) }
+    // Do not inspect or mutate user-owned PATH directories during uninstall.
+    let manageCLILink = canManageCLILink()
+    let hasCLILink = manageCLILink ? (try validateCLILink()) : false
 
     if jobIsLoaded() {
         _ = try callLaunchctl(["bootout", "system/" + jobLabel])
@@ -1419,7 +1435,11 @@ func uninstallBrightness() throws {
     if hasCLILink { try fm.removeItem(atPath: cliLink) }
     if fm.fileExists(atPath: daemonPlist) { try fm.removeItem(atPath: daemonPlist) }
     if hasDirectory { try fm.removeItem(atPath: installDirectory) }
-    print("Uninstalled \(jobLabel), preferences, executable, and managed PATH link.")
+    print("Uninstalled \(jobLabel), preferences and executable" +
+          (hasCLILink ? ", and managed PATH link." : "."))
+    if !manageCLILink {
+        print("Skipped untrusted PATH directory \(cliBinDirectory); no files were changed there.")
+    }
 }
 
 func installationStatus() throws {
@@ -1429,7 +1449,12 @@ func installationStatus() throws {
     let plist = try validateManagedPath(daemonPlist, directory: false)
     print("Install: \(dir && binary && config && plist ? "complete" : "incomplete / not installed")")
     print("launchd loaded: \(jobIsLoaded() ? "yes" : "no")")
-    print("CLI PATH link: \((try validateCLILink()) ? cliLink : "not installed")")
+    if canManageCLILink() {
+        print("CLI PATH link: \((try validateCLILink()) ? cliLink : "not installed")")
+    } else {
+        print("CLI PATH link: skipped (missing or non-root-owned \(cliBinDirectory))")
+        if binary { print("Installed CLI: \(installedExecutable)") }
+    }
     if config {
         let installedMode = try readInstalledModeName()
         print("Configured mode: \(installedMode)")
