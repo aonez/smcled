@@ -1249,6 +1249,45 @@ func installedUserCLILink() throws -> Bool {
     return true
 }
 
+// Keep zsh's PATH usable without editing ~/.zprofile if it is already configured.
+// This function is intentionally called as the ordinary user, never under root.
+func ensureUserZshCLIPath() throws {
+    try requireUnprivilegedUser()
+    let probe = Process()
+    probe.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    probe.arguments = ["-lic", #"case ":$PATH:" in *":$HOME/.local/bin:"*) exit 0 ;; *) exit 1 ;; esac"#]
+    probe.standardOutput = FileHandle.nullDevice
+    probe.standardError = FileHandle.nullDevice
+    try probe.run()
+    probe.waitUntilExit()
+    if probe.terminationStatus == 0 { return }
+
+    let profile = NSHomeDirectory() + "/.zprofile"
+    let export = #"export PATH="$HOME/.local/bin:$PATH""#
+    var attrs = stat()
+    let exists = lstat(profile, &attrs) == 0
+    if exists {
+        guard (attrs.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              attrs.st_uid == geteuid() else {
+            throw ToolError("Refusing to edit unexpected or non-user-owned ~/.zprofile")
+        }
+    } else if errno != ENOENT {
+        throw ToolError("Cannot inspect ~/.zprofile: errno \(errno)")
+    }
+
+    let current = exists ? try String(contentsOfFile: profile, encoding: .utf8) : ""
+    guard !current.components(separatedBy: .newlines).contains(export) else { return }
+    if !exists && !FileManager.default.createFile(atPath: profile, contents: nil) {
+        throw ToolError("Could not create ~/.zprofile")
+    }
+    let output = try FileHandle(forWritingTo: URL(fileURLWithPath: profile))
+    defer { try? output.close() }
+    _ = try output.seekToEnd()
+    let separator = current.isEmpty || current.hasSuffix("\n") ? "" : "\n"
+    try output.write(contentsOf: Data((separator + "# smcled: add per-user command directory\n" + export + "\n").utf8))
+    print("Added ~/.local/bin to ~/.zprofile; open a new Terminal window to use smcled.")
+}
+
 func manageUserCLILink(remove: Bool = false) throws {
     try requireUnprivilegedUser()
     if !remove {
@@ -1284,10 +1323,33 @@ func manageUserCLILink(remove: Bool = false) throws {
         throw ToolError("Could not verify the per-user smcled symlink")
     }
     print("User CLI link: \(link)")
-    print("Add to ~/.zprofile if needed: export PATH=\"$HOME/.local/bin:$PATH\"")
+    try ensureUserZshCLIPath()
     print("Use smcled --status or smcled --auto-preview without sudo.")
     print("For privileged operations, use the protected absolute executable:")
     print("  sudo \"\(installedExecutable)\" --auto-check")
+}
+
+// Only run home-directory setup as the original sudo caller. The daemon itself
+// always uses the root-owned executable; never trust the per-user PATH entry.
+@discardableResult
+func runUserCLISetup(remove: Bool = false) throws -> Bool {
+    guard let rawUID = ProcessInfo.processInfo.environment["SUDO_UID"],
+          let uid = uid_t(rawUID), uid != 0,
+          let entry = getpwuid(uid) else {
+        print("No sudo caller identified: per-user CLI setup skipped.")
+        return false
+    }
+    let username = String(cString: entry.pointee.pw_name)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+    process.arguments = ["-n", "-H", "-u", username, installedExecutable,
+                         remove ? "--uninstall-user-cli" : "--install-user-cli"]
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw ToolError("Per-user CLI setup failed for \(username) (exit \(process.terminationStatus))")
+    }
+    return true
 }
 
 func executableSource() throws -> String {
@@ -1372,11 +1434,8 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     let _ = try validateManagedPath(brightnessPreference, directory: false)
     let _ = try validateManagedPath(modePreference, directory: false)
     let _ = try validateManagedPath(daemonPlist, directory: false)
-    // The CLI symlink is optional and must NOT prevent auto installation.
-    // Many Intel Macs use a user-owned Homebrew /usr/local/bin. Do not
-    // change its ownership/permissions or place a trusted sudo command there.
-    let manageCLILink = canManageCLILink()
-    if manageCLILink { _ = try validateCLILink() }
+    // Do not inspect or modify /usr/local/bin: it may be user-owned by Homebrew.
+    // Set up ~/.local/bin only after the protected binary is installed, as the user.
 
     // A reload is needed if the binary or plist changes.
     if jobIsLoaded() {
@@ -1394,10 +1453,15 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     let needsExperimentalAcknowledgment = !intel && !physicallyTestedDesktops.contains(modelID())
     try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval,
                                                           acknowledged: needsExperimentalAcknowledgment))
-    if manageCLILink { try installCLILink() }
     // A previously disabled service must be re-enabled explicitly.
     _ = try callLaunchctl(["enable", "system/" + jobLabel])
     _ = try callLaunchctl(["bootstrap", "system", daemonPlist])
+    var userCLIInstalled = false
+    do {
+        userCLIInstalled = try runUserCLISetup()
+    } catch {
+        writeStderr("WARNING: LaunchDaemon installed, but user CLI setup failed: \(error)\n")
+    }
 
     // RunAtLoad already starts the automatic fade. Do NOT duplicate that work
     // from this installer: two concurrent SMC fade loops would interfere.
@@ -1406,14 +1470,12 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
           ? "Installed \(jobLabel); \(intel ? "Intel white-only" : "white/amber") automatic sunrise/sunset mode (every \(interval) seconds)."
           : "Installed \(jobLabel); saved mode \(mode.rawValue), brightness \(brightness).")
     print("Boot-time job: \(daemonPlist)")
-    if manageCLILink {
-        print("Shell command: \(cliLink) (sudo required to write)")
+    if userCLIInstalled {
+        print("Shell command: ~/.local/bin/smcled (open a new Terminal if PATH was updated)")
     } else {
-        print("PATH symlink skipped: \(cliBinDirectory) is absent or not a trusted root-owned directory.")
-        print("Use the installed executable: sudo \"\(installedExecutable)\" <command>")
-        print("Do not change ownership of \(cliBinDirectory) just to install smcled.")
-        print("To create a per-user command, run without sudo: ./smcled --install-user-cli")
+        print("User CLI not installed; run ./smcled --install-user-cli without sudo.")
     }
+    print("For sudo commands, prefer: sudo \"\(installedExecutable)\" <command>")
 }
 
 func readInstalledBrightness() throws -> UInt8 {
@@ -1521,6 +1583,12 @@ func uninstallBrightness() throws {
         }
     } catch {
         writeStderr("WARNING: Could not restore LED brightness: \(error)\n")
+    }
+    // Remove only the original sudo caller's managed user link. Keep the
+    // user's PATH configuration because other applications may use it.
+    if hasDirectory && fm.fileExists(atPath: installedExecutable) {
+        do { _ = try runUserCLISetup(remove: true) }
+        catch { writeStderr("WARNING: Could not remove user CLI link: \(error)\n") }
     }
     if hasCLILink { try fm.removeItem(atPath: cliLink) }
     if fm.fileExists(atPath: daemonPlist) { try fm.removeItem(atPath: daemonPlist) }
@@ -2614,7 +2682,7 @@ func usage() {
     option("sudo smcled --auto-check", "Apply the current solar target once; no installation.")
     option("sudo smcled --install-auto [seconds]", "Install a periodic LaunchDaemon; 300s default, 30...86400s allowed. Intel: 7 white-only events; Apple Silicon: 6 white/amber events.")
     option("smcled --status", "Show saved preferences, daemon state, interval and optional PATH link.")
-    option("smcled --install-user-cli", "Without sudo: create ~/.local/bin/smcled pointing to the protected installed executable.")
+    option("smcled --install-user-cli", "Without sudo: create ~/.local/bin/smcled and configure zsh PATH if needed.")
     option("smcled --uninstall-user-cli", "Without sudo: remove only your ~/.local/bin/smcled shortcut.")
     option("sudo smcled --uninstall", "Stop the daemon, remove managed files and restore LED control.")
     option("sudo smcled --install 10", "Apple Silicon only: persist white brightness.")
@@ -2623,7 +2691,7 @@ func usage() {
     option("sudo smcled --install amber-blink 50", "Apple Silicon only: persist single amber flashing.")
     option("sudo smcled --install amber-double 50", "Apple Silicon only: persist double amber flashing.")
     print("  On Intel, only --install-auto is supported; fixed modes are blocked.")
-    print("  If /usr/local/bin is user-owned, installation skips the optional CLI link.")
+    print("  Installation configures ~/.local/bin for the invoking sudo user; /usr/local/bin is untouched.")
     print("  The protected executable remains at /Library/Application Support/smcled/smcled.")
 
     section("COMPATIBILITY AND READ-ONLY TOOLS")
