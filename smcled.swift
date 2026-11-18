@@ -2456,85 +2456,103 @@ func testZeroBrightness() throws {
 }
 
 func usage() {
-    print("""
-    smcled — AppleSMC status LED CLI for Mac mini and Mac Studio
+    // Do not manually align text inside a multiline literal: long commands
+    // collide with the description column, and terminal fonts/windows vary.
+    // Keep a fixed command column and wrap descriptions to 88 characters.
+    let columnWidth = 36
+    let maxLineWidth = 88
 
-      sudo smcled 10                      White at brightness 10
-      sudo smcled --white [0...255]      White; optional brightness (current if omitted)
-      sudo smcled --amber [0...255]      Steady amber; optional brightness
-      sudo smcled --amber-blink [0...255]
-                                          Single amber flashing
-      sudo smcled --amber-double [0...255]
-                                          Double amber flashing
-      sudo smcled --off                  Turn LED off (white brightness 0)
-      sudo smcled --reset                Default white brightness (255)
-      sudo smcled --intel-brightness 50  Intel 2018: custom white brightness 0...255 (experimental)
-      sudo smcled --fade 50 [seconds]     Intel: proportional software fade (0->255 takes 1s)
-                                          Apple Silicon: native channel write when seconds omitted
-                                          Explicit seconds: timed software fade on either architecture
-      sudo smcled 50 --no-fade           Intel: bypass software fade (Apple Silicon already native)
-      sudo smcled --intel-full           Intel 2018: force full-bright white
-      sudo smcled --intel-restore        Intel 2018: return to system-controlled white
-      smcled --intel-led-status          Intel 2018: read-only SIL state
-      # Intel 2018: --off turns LED off; --reset or --white restores
-      # Intel 2018: --white 50 or bare 50 also sets custom white level
-      # Manual brightness commands fade by default; --no-fade opts out
-      # Intel 2018: amber and fixed-mode installation remain disabled
-      # Intel 2018: --install-auto uses the same schedule, white brightness only
+    func section(_ heading: String) {
+        print("\n\(heading)")
+    }
 
-      sudo smcled --install 10           Persist white brightness 10
-      sudo smcled --install white 10     Persist white brightness 10
-      sudo smcled --install amber 10     Persist steady amber brightness 10
-      sudo smcled --install amber-blink 50
-                                          Persist single flashing amber at 50
-      sudo smcled --install amber-double 50
-                                          Persist double flashing amber at 50
-      sudo smcled --install-auto [seconds]
-                                          Sunrise/sunset checks; 300s default (30...86400)
-                                          Intel 2018: white-only; Apple Silicon: white/amber
-      smcled --auto-preview               Show today's solar events & LED plan
-      smcled --auto-preview <lat> <lon> <IANA-timezone>
-                                          Preview with explicit coordinates
-      sudo smcled --auto-check            Apply appropriate state right now
-      sudo smcled --test-zero             Reversible white/amber 0 test
-      smcled --status                    Read configured settings; no sudo
-      sudo smcled --uninstall            Remove daemon, files, symlink; reset LED
+    func option(_ command: String, _ description: String) {
+        let shortCommand = command.count <= columnWidth - 2
+        let commandLine = "  " + command
+        if !shortCommand { print(commandLine) }
+        let prefix: String = shortCommand
+            ? commandLine + String(repeating: " ", count: columnWidth - command.count)
+            : "      "
+        let continuation = String(repeating: " ", count: prefix.count)
+        var line = prefix
+        for word in description.split(separator: " ") {
+            let value = String(word)
+            let separator = line == prefix ? "" : " "
+            if line != prefix && line.count + separator.count + value.count > maxLineWidth {
+                print(line)
+                line = continuation + value
+            } else {
+                line += separator + value
+            }
+        }
+        print(line)
+    }
 
-      smcled --compatibility             Read-only hardware capability report
-      smcled --sample-brightness         Read LSLN repeatedly, without writes
-      smcled --intel-snapshot              Read-only Intel SMC LED key inventory
-      sudo smcled --intel-suite --confirm-hardware-test
-                                          Three reversible Intel LSLN tests
-      sudo smcled --intel-probe first 32 --confirm-hardware-test
-      sudo smcled --intel-probe second 100 --confirm-hardware-test
-                                          Select byte and value without recompiling
-      sudo smcled --test-intel-brightness 100 --confirm-hardware-test
-                                          Legacy second-byte test on Macmini8,1
-      --accept-untested-model             Enable a matching but untested Apple Silicon
-                                          mini/Studio (including future models)
-      smcled --compatibility-self-test   Offline signature classification tests
-      sudo smcled --test-brightness 100 --confirm-hardware-test
-                                          Reversible LSLN probe on candidate models
-      sudo smcled --test-studio-amber --confirm-hardware-test
-                                          Reversible steady amber probe on Mac16,9
-      smcled model                       Print hardware identifier
-      smcled read <FOURCC>               Read an SMC key
-      smcled info <FOURCC>               Read key metadata
-      smcled scan [--all]                Enumerate keys (read only)
-      sudo smcled --test-amber-brightness 10
-                                          Temporary brightness/amber experiment
-      sudo smcled --test-amber [4|8|9]   3-second reversible preset test
-      sudo smcled --test-dual-channel     Sample white/amber PWM during switching
-      sudo smcled led <KEY> <0...255> --confirm-led-key [--mode vv|v0]
-      sudo smcled test <KEY> --confirm-led-key [--mode vv|v0]
+    print("smcled — AppleSMC status LED CLI for Mac mini and Mac Studio")
 
-    Brightness: integer 0...255. Without a value, amber commands retain
-    the current LSLN brightness; --install <mode> without a value retains
-    the saved brightness (or defaults to 255 on a new installation).
-    Immediate changes do not modify the saved boot preference.
-    Steady amber dimming confirmed on hardware; flashing dimming not yet tested.
-    """)
+    section("BRIGHTNESS AND COLOR")
+    option("sudo smcled 10", "Set white brightness 0...255. Intel fades by default; Apple Silicon uses native behavior.")
+    option("sudo smcled 10 --no-fade", "Intel: change brightness immediately, without the software fade.")
+    option("sudo smcled --white [0...255]", "White LED; on Intel, omit the number to restore system control.")
+    option("sudo smcled --off", "Turn the LED off.")
+    option("sudo smcled --reset", "Restore white: native Intel system control or Apple Silicon brightness 255.")
+    option("sudo smcled --fade 50 [seconds]", "Intel: proportional fade (full 0...255 range takes 1s); Apple Silicon: native write unless seconds specified.")
+    option("sudo smcled --amber [0...255]", "Apple Silicon only: steady amber; retain brightness if omitted.")
+    option("sudo smcled --amber-blink [0...255]", "Apple Silicon only: single amber flashes.")
+    option("sudo smcled --amber-double [0...255]", "Apple Silicon only: double amber flashes.")
+
+    section("INTEL MAC MINI 2018 (WHITE LED ONLY)")
+    option("sudo smcled --intel-brightness 50", "Set white brightness 0...255, using proportional software fade.")
+    option("sudo smcled --intel-full", "Set full white brightness.")
+    option("sudo smcled --intel-restore", "Restore firmware-controlled white brightness.")
+    option("smcled --intel-led-status", "Read current Intel LED registers.")
+    print("  Amber and fixed-mode installation are not available on Macmini8,1.")
+
+    section("AUTOMATIC MODE AND INSTALLATION")
+    option("smcled --auto-preview", "Preview the solar schedule without modifying the LED.")
+    option("smcled --auto-preview <lat> <lon> <tz>", "Preview using explicit coordinates and an IANA time zone.")
+    option("sudo smcled --auto-check", "Apply the current solar target once; no installation.")
+    option("sudo smcled --install-auto [seconds]", "Install a periodic LaunchDaemon; 300s default, 30...86400s allowed. Intel: 7 white-only events; Apple Silicon: 6 white/amber events.")
+    option("smcled --status", "Show saved preferences, daemon state, interval and optional PATH link.")
+    option("sudo smcled --uninstall", "Stop the daemon, remove managed files and restore LED control.")
+    option("sudo smcled --install 10", "Apple Silicon only: persist white brightness.")
+    option("sudo smcled --install white 10", "Apple Silicon only: persist white brightness.")
+    option("sudo smcled --install amber 10", "Apple Silicon only: persist steady amber.")
+    option("sudo smcled --install amber-blink 50", "Apple Silicon only: persist single amber flashing.")
+    option("sudo smcled --install amber-double 50", "Apple Silicon only: persist double amber flashing.")
+    print("  On Intel, only --install-auto is supported; fixed modes are blocked.")
+    print("  If /usr/local/bin is user-owned, installation skips the optional CLI link.")
+    print("  The protected executable remains at /Library/Application Support/smcled/smcled.")
+
+    section("COMPATIBILITY AND READ-ONLY TOOLS")
+    option("smcled --compatibility", "Show recognized LED SMC key profile and model support.")
+    option("smcled --compatibility-self-test", "Run hardware-independent model, fade and schedule tests.")
+    option("smcled model", "Print the Mac model identifier.")
+    option("smcled --sample-brightness", "Read LSLN repeatedly, without writes.")
+    option("smcled --intel-snapshot", "Read-only Intel SMC LED key inventory.")
+    option("smcled read <FOURCC>", "Read a single SMC key.")
+    option("smcled info <FOURCC>", "Display SMC key metadata.")
+    option("smcled scan [--all]", "Enumerate SMC keys without writing.")
+    option("--accept-untested-model", "Explicit opt-in for matching but untested Apple Silicon Mac mini/Studio models.")
+
+    section("HARDWARE EXPERIMENTS (SUDO; USE WITH CARE)")
+    option("sudo smcled --test-zero", "Reversible Apple Silicon zero-brightness test.")
+    option("sudo smcled --test-brightness 100 --confirm-hardware-test", "Reversible brightness test on candidate models.")
+    option("sudo smcled --test-studio-amber --confirm-hardware-test", "Reversible Mac16,9 amber test.")
+    option("sudo smcled --test-amber-brightness 10", "Reversible Apple Silicon steady-amber brightness test.")
+    option("sudo smcled --test-amber [4|8|9]", "Reversible Apple Silicon amber preset test.")
+    option("sudo smcled --test-dual-channel", "Sample Apple Silicon white/amber PWM during switching.")
+    option("sudo smcled --intel-suite --confirm-hardware-test", "Legacy three-stage Intel LSLN research test.")
+    option("sudo smcled --intel-probe first 32 --confirm-hardware-test", "Legacy Intel first-byte LSLN probe.")
+    option("sudo smcled --intel-probe second 100 --confirm-hardware-test", "Legacy Intel second-byte LSLN probe.")
+    option("sudo smcled --test-intel-brightness 100 --confirm-hardware-test", "Legacy Intel second-byte brightness probe.")
+    option("sudo smcled led <KEY> <0...255> --confirm-led-key [--mode vv|v0]", "Restricted direct LED key write.")
+    option("sudo smcled test <KEY> --confirm-led-key [--mode vv|v0]", "Restricted reversible LED key test.")
+
+    print("\nBrightness range: 0...255. Manual changes never modify saved preferences.")
+    print("Automatic solar checks run at startup and at the configured interval.")
 }
+
 func verifyLED(_ smc: SMC, key: String, args: [String]) throws -> String {
     guard modelID() == "Macmini9,1" else {
         throw ToolError("LED writes restricted to Macmini9,1; detected \(modelID())")
