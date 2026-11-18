@@ -315,7 +315,7 @@ func testAmberCandidate(_ smc: SMC, candidate: UInt8, cancellation: Cancellation
 // PWM preset, and LSOO=1 was physically verified to force full-white on this
 // exact Macmini8,1. Whether modifying LSLB changes physical brightness remains
 // UNKNOWN. A single half-scale value is tried, restored unconditionally.
-func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, candidate: [UInt8]) throws {
+func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, candidate: [UInt8], allowCustom: Bool = false) throws {
     try checkKey(smc, "LSLB", size: 2, type: "ui16", readable: true, writable: true)
     try checkKey(smc, "LSSV", size: 2, type: "ui16", readable: true, writable: true)
     let original = try smc.read("LSLB")
@@ -329,8 +329,11 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, candida
     }
     // Exactly these four PWM presets were chosen for hardware exploration.
     // No arbitrary SMC register value can be supplied on the command line.
-    guard [[0x08, 0x00], [0x10, 0x00], [0x20, 0x00], [0x7F, 0xFF]].contains(candidate) else {
-        throw TestError("Unsupported Intel brightness candidate")
+    let presets: [[UInt8]] = [[0x08, 0x00], [0x10, 0x00], [0x20, 0x00], [0x7F, 0xFF]]
+    guard candidate.count == 2 &&
+          (presets.contains(candidate) ||
+           (allowCustom && candidate[0] == candidate[1] && candidate[0] > 0)) else {
+        throw TestError("Unsupported experimental Intel brightness value")
     }
     print("\nUNVERIFIED Intel variable-brightness experiment:")
     print("  Temporarily set LSLB FF FF -> \(hex(candidate)), then LSOO=1 for 2s.")
@@ -427,18 +430,29 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, candida
 
 func run() throws {
     let args = Array(CommandLine.arguments.dropFirst())
-    guard args.count == 1 || args.count == 2 else {
-        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--test-amber|--test-amber-fw0|--test-amber-fw1|--test-amber-blink|--test-amber-double|--test-full-dim|--test-low-dim|--test-very-low-dim|--test-mid-dim|--suite --confirm-hardware-test")
+    let customLevel: UInt8?
+    if args.count == 3, args[0] == "--test-brightness",
+       args[2] == "--confirm-hardware-test", !args[1].isEmpty,
+       args[1].allSatisfy({ $0 >= "0" && $0 <= "9" }),
+       let number = UInt8(args[1]) {
+        customLevel = number
+    } else {
+        customLevel = nil
     }
+    let standardModes = ["--test-off", "--test-on", "--test-amber", "--test-amber-fw0",
+                         "--test-amber-fw1", "--test-amber-blink", "--test-amber-double",
+                         "--test-full-dim", "--test-low-dim", "--test-very-low-dim",
+                         "--test-mid-dim", "--suite"]
+    let standardTest = args.count == 2 && args[1] == "--confirm-hardware-test" &&
+                       standardModes.contains(args[0])
     guard modelID() == "Macmini8,1" else { throw TestError("Only Macmini8,1 is supported") }
     let smc = try SMC()
     if args == ["--snapshot"] {
         snapshot(smc, heading: "Intel SIL state (read only):")
         return
     }
-    guard args.count == 2, args[1] == "--confirm-hardware-test",
-          ["--test-off", "--test-on", "--test-amber", "--test-amber-fw0", "--test-amber-fw1", "--test-amber-blink", "--test-amber-double", "--test-full-dim", "--test-low-dim", "--test-very-low-dim", "--test-mid-dim", "--suite"].contains(args[0]) else {
-        throw TestError("Invalid command or missing explicit confirmation")
+    guard standardTest || customLevel != nil else {
+        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-brightness <0...255> --confirm-hardware-test | sudo ./intel-sil-probe <existing-test> --confirm-hardware-test")
     }
     try preflight(smc)
     let cancellation = Cancellation()
@@ -456,7 +470,15 @@ func run() throws {
             snapshot(smc, heading: "Final post-test snapshot:")
         } catch { err("WARNING: final state inspection/emergency restore failed: \(error)\n") }
     }
-    if ["--test-amber", "--test-amber-fw0", "--test-amber-fw1",
+    if let level = customLevel {
+        if level == 0 {
+            // Always use the physically verified on/off command for zero.
+            try test(smc, command: 0, cancellation: cancellation)
+        } else {
+            try testFullBrightnessCandidate(smc, cancellation: cancellation,
+                                            candidate: [level, level], allowCustom: true)
+        }
+    } else if ["--test-amber", "--test-amber-fw0", "--test-amber-fw1",
         "--test-amber-blink", "--test-amber-double"].contains(args[0]) {
         let candidates: [String: UInt8] = [
             "--test-amber": 4, "--test-amber-fw0": 0, "--test-amber-fw1": 1,
