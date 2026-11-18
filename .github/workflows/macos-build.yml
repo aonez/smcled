@@ -13,6 +13,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build smcled
         run: swiftc -O smcled.swift -framework IOKit -o smcled
+      - name: Build standalone Intel research probe (compile only, no SMC writes)
+        run: swiftc -O smcled-intel-lsoo-probe.swift -framework IOKit -o intel-sil-probe
       - name: Run hardware-free compatibility tests
         run: ./smcled --compatibility-self-test
       - name: Verify CLI help
