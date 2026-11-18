@@ -463,7 +463,7 @@ func futureAppleSiliconDesktop(_ model: String) -> Bool {
 func requireSupportedLEDHost(smc existingSMC: SMC? = nil) throws {
     let model = modelID()
     if model == "Macmini8,1" {
-        throw ToolError("Intel Mac mini LED encoding is unverified; regular LED writes remain disabled")
+        throw ToolError("Intel Mac mini 2018 uses a separate white-only SMC LED interface; amber/color controls are unsupported")
     }
     let knownModel = supportedAppleSiliconDesktops.contains(model)
     let acknowledged = CommandLine.arguments.contains("--accept-untested-model")
@@ -917,7 +917,8 @@ func intelSILStatus() throws {
         print("  \(key): \(value)")
     }
     print("Off, full-white, white blink patterns and selected dimming values verified on one Macmini8,1.")
-    print("Custom 0...255 levels are experimental; amber and sleep/wake persistence remain unverified.")
+    print("Custom 0...255 levels and software fades are experimental; Intel amber/color is unsupported.")
+    print("White-only flash patterns have been physically observed on Macmini8,1.")
 }
 
 // Reject symlinks and unexpected ownership in privileged file destinations.
@@ -2446,6 +2447,9 @@ func run(_ originalArguments: [String]) throws {
         print("Normal white LED restored\(brightness.map { " at brightness \($0)" } ?? ""); boot preference unchanged.")
         return
     case "--amber", "--amber-blink", "--amber-double":
+        if modelID() == "Macmini8,1" {
+            throw ToolError("Macmini8,1 LED control is white-only; amber is not supported. Use --intel-fade, a white brightness command, or --reset.")
+        }
         guard arguments.count == 1 || arguments.count == 2 else {
             throw ToolError("Usage: sudo smcled \(command) [0...255]")
         }
