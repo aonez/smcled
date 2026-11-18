@@ -747,3 +747,27 @@ Important: `LSPV` differs from `LSLB` and `LSLN` but **this is not conclusive ab
 **Next controlled experiment:** observe read-only `LSPV` at approximately 100–200 ms intervals *during* the already-tested reversible `LSLN` suite. Correlation (or its absence) will establish whether `LSLN` changes propagate into the reported live PWM. Do not write `LSLB`, `LSOO`, `LSSV`, `LSSE`, `LSSB`, or `LSUP` until supported by further independent evidence. Changing `LSLN` was already completed without visible effect on this particular machine, but no user test is risk-free.
 
 Independent reference: https://github.com/floe/smc_util/blob/master/docs/readme.md (historic SIL key semantics, not guaranteed for T2).
+
+
+## 18 November 2026 — Physically verified Intel T2 LED control (supersedes older Intel hypotheses)
+
+Hardware: 2018 Intel Mac mini `Macmini8,1`, J174, macOS 15.8.2, T2 bridgeOS 24P6005.
+
+The user's tests conclusively showed that the Intel mini's front LED is software controllable through a **different SMC path** from Apple Silicon:
+
+| Operation | SMC registers | Observed physical LED and output |
+|---|---|---|
+| Factory mode | `LSRB=00` | Normal white, `LSPV=14 11`, `LSOF=00`; restoration may fade |
+| Force off | `LSOO=00` | White LED goes out, `LSPV=00 00`, `LSOF=01` |
+| Force full-white | `LSOO=01`, original `LSLB=FF FF` | Very bright white, `LSPV=6B 08` |
+| Intermediate brightness | Set `LSLB`, then `LSOO=01` | `LSLB=08 00 → LSPV=03 58`; `10 00 → 06 B0`; `20 00 → 0D 61`; `7F FF → 35 84` |
+| White single flashing | `LSSB=08 00` | Repeating one **white** flash; PWM toggles between `00 00` and `6B 08` |
+| White double flashing | `LSSB=09 00` | Repeating two **white** flashes; same PWM endpoints |
+
+The LSLB→LSPV mapping follows approximately `LSPV ≈ 27400 × LSLB/65535`. This is **electronic PWM**, not perceptual or physical luminance calibration. User additionally tested manual levels `1,2,5,10,20,25,30,50,60,80,100,120,140,255`; reported LSPV values tracked the requested settings consistently, with visible differences among many levels.
+
+**Transition behavior:** Original manual custom→custom implementation called `LSRB` and temporarily returned to normal firmware brightness, producing visible flashes at small step differences. The revised implementation writes `LSLB` directly while the `LSOO=1` manual override is active; user confirmed transitions are smooth without jumps but visually immediate (no intrinsic fade). `smcled --intel-fade <level> [seconds]` now provides an opt-in, software-generated smoothstep interpolation of 16-bit LSLB values; **the fade itself still needs physical testing**.
+
+**Amber intentionally unsupported on Intel:** None of the candidate `LSSB` modes `04 00` and `01 00` produced an amber light. `00 00` switched the white LED off. Modes `08 00` and `09 00` produced white, not amber, blinking. The Intel 2018 mini appears to have a white-only front LED, consistent with model-specific hardware documentation. The main CLI explicitly rejects `--amber`, `--amber-blink`, and `--amber-double` on this model. The standalone probe no longer exposes speculative amber tests, but preserves confirmed `--test-white-blink` and `--test-white-double` experiments.
+
+Do not confuse those Intel WHITE blink commands with Apple Silicon AMBER presets even when their `LSSB` payloads match. Apple Silicon amber operation remains unchanged. The new Intel controls and experiments remain on `feature/intel-lsoo-onoff-probe-20261117`; no new pull requests or changes to `main`.
