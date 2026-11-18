@@ -412,10 +412,11 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, candida
     let finalLSLB = try smc.read("LSLB")
     let finalPWM = try smc.read("LSPV")
     let finalOff = try smc.read("LSOF")
+    let finalLSLN = try smc.read("LSLN")
+    let finalForced = try smc.read("LS! ")
     let finalValid = restoredNormal && finalLSLB == original &&
                      finalPWM == [0x14, 0x11] && finalOff == [0] &&
-                     (try smc.read("LSLN")) == [0x2F, 0xFF] &&
-                     (try smc.read("LS! ")) == [0]
+                     finalLSLN == [0x2F, 0xFF] && finalForced == [0]
     guard finalValid && restorationErrors.isEmpty else {
         throw TestError("Full-on brightness test: restoration not fully confirmed: LSLB=\(hex(finalLSLB)), LSPV=\(hex(finalPWM)), LSOF=\(hex(finalOff)), errors=\(restorationErrors); STOP and inspect the LED")
     }
