@@ -246,10 +246,55 @@ func test(_ smc: SMC, command: UInt8, cancellation: Cancellation) throws {
     }
     if let stepError { throw stepError }
 }
+// Research-only candidate, NOT a verified Intel color command.
+// J174 MacEFI references LSSB, while Apple Silicon hardware confirmed
+// LSSB [04 00] as steady amber. The mapping on T2 is UNKNOWN. It must
+// never be applied as a normal color mode unless physically verified.
+func testAmberCandidate(_ smc: SMC, cancellation: Cancellation) throws {
+    try checkKey(smc, "LSSB", size: 2, type: "hex_", readable: false, writable: true)
+    guard try smc.read("LSLN") == [0x2F, 0xFF],
+          try smc.read("LSOF") == [0],
+          try smc.read("LSPV") == [0x14, 0x11],
+          try smc.read("LS! ") == [0] else {
+        throw TestError("Amber experiment requires the verified normal-white baseline")
+    }
+    print("\nUNVERIFIED Intel amber candidate: LSSB=04 00 for 2 seconds.")
+    print("Watch the LED color. SMC PWM readback cannot establish whether it is amber.")
+    var writeError: Error?
+    do {
+        try cancellation.check()
+        try smc.write("LSSB", bytes: [4, 0])
+        for index in 1...8 {
+            try cancellation.pause(0.25)
+            print("  +\(Double(index) * 0.25)s LSPV=\(hex(try smc.read("LSPV"))) LSOF=\(hex(try smc.read("LSOF")))")
+        }
+    } catch { writeError = error }
+    // Attempt restoration even if the write or sampling fails.
+    try smc.write("LSRB", bytes: [0])
+    let deadline = Date().addingTimeInterval(6)
+    var restored = false
+    repeat {
+        let status = try smc.read("LSOF")
+        let pwm = try smc.read("LSPV")
+        print("  Restoring: LSPV=\(hex(pwm)) LSOF=\(hex(status))")
+        if status == [0], pwm == [0x14, 0x11],
+           try smc.read("LSLN") == [0x2F, 0xFF],
+           try smc.read("LS! ") == [0] {
+            restored = true
+            break
+        }
+        Thread.sleep(forTimeInterval: 0.25)
+    } while Date() < deadline
+    guard restored else {
+        throw TestError("Amber candidate: baseline not confirmed after LSRB; inspect physical LED and STOP")
+    }
+    print("Normal-white SMC telemetry restored. Was the LED amber, white, or unchanged?")
+    if let writeError { throw writeError }
+}
 func run() throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count == 1 || args.count == 2 else {
-        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--suite --confirm-hardware-test")
+        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--test-amber|--suite --confirm-hardware-test")
     }
     guard modelID() == "Macmini8,1" else { throw TestError("Only Macmini8,1 is supported") }
     let smc = try SMC()
@@ -258,7 +303,7 @@ func run() throws {
         return
     }
     guard args.count == 2, args[1] == "--confirm-hardware-test",
-          ["--test-off", "--test-on", "--suite"].contains(args[0]) else {
+          ["--test-off", "--test-on", "--test-amber", "--suite"].contains(args[0]) else {
         throw TestError("Invalid command or missing explicit confirmation")
     }
     try preflight(smc)
@@ -277,8 +322,12 @@ func run() throws {
             snapshot(smc, heading: "Final post-test snapshot:")
         } catch { err("WARNING: final state inspection/emergency restore failed: \(error)\n") }
     }
-    let commands: [UInt8] = args[0] == "--suite" ? [0, 1] : [args[0] == "--test-off" ? 0 : 1]
-    for value in commands { try test(smc, command: value, cancellation: cancellation) }
+    if args[0] == "--test-amber" {
+        try testAmberCandidate(smc, cancellation: cancellation)
+    } else {
+        let commands: [UInt8] = args[0] == "--suite" ? [0, 1] : [args[0] == "--test-off" ? 0 : 1]
+        for value in commands { try test(smc, command: value, cancellation: cancellation) }
+    }
     print("Finished. No persistent settings were installed.")
 }
 do { try run() }
