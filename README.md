@@ -42,45 +42,50 @@ All three state commands require \`sudo\`, check the \`Macmini8,1\` model and ex
 
 **Not supported on Intel yet:** \`--white 0...255\`, bare numeric brightness, \`--amber\` and other color modes, \`--install\`, and \`--install-auto\`. Previous \`LSLN\` experiments changed internal \`LSPV\` telemetry but did not visibly dim the LED. Sleep/wake/restart behavior is untested.
 
-### Experimental Intel adjustable brightness
+### Intel variable-brightness research (physically observed)
 
-On the tested Intel Mac, writing \`LSLN\` changed the firmware's \`LSPV\` readings but did **not** visibly dim the LED. Changing \`LSLB\` (historically the full-on PWM preset) from \`FF FF\` to \`7F FF\`, followed by \`LSOO=1\`, produced a stable \`LSPV=35 84\`, exactly half the full-on \`6B 08\` value. The user observed two brightness changes (up to test level and down to normal), but **did not yet confirm sub-normal dimming**.
+The **full-on PWM preset** \`LSLB\`, combined with \`LSOO=1\`, changes the reported LED output linearly. The tested 2018 Mac mini physically dimmed when \`LSLB=10 00\`; the experiment was repeated three times. These are different brightness values, not three hardware modes.
 
-To investigate brightness lower than normal, a separately gated experiment uses \`LSLB=10 00\`, predicted to produce PWM around \`06 B0\` (below normal \`14 11\`). This is a prediction; the physical effect remains unknown.
+| Temporary \`LSLB\` setting | Observed \`LSPV\` | Physical outcome |
+|---|---|---|
+| \`10 00\` | \`06 B0\` | Visibly below normal brightness, three repeat tests |
+| \`7F FF\` | \`35 84\` | Above normal, roughly half of the full-on PWM |
+| \`FF FF\` | \`6B 08\` | Previously verified full white |
+| *(normal mode, via \`LSRB\`)* | \`14 11\` | Normal white (does not use full-on override) |
+
+The relationship is approximately \`LSPV ≈ 0.4181 × LSLB\`, interpreting the 2-byte values as **big-endian unsigned PWM integers**. This is SMC telemetry, not a calibrated photometric measurement of the LED.
+
+To test additional bounded values physically, the standalone diagnostic supports these separate experiments:
 
 \`\`\`sh
 swiftc -O smcled-intel-lsoo-probe.swift -framework IOKit -o intel-sil-probe
-sudo ./intel-sil-probe --test-low-dim --confirm-hardware-test
+sudo ./intel-sil-probe --test-very-low-dim --confirm-hardware-test  # LSLB=08 00; predicted LSPV≈03 58
+sudo ./intel-sil-probe --test-mid-dim --confirm-hardware-test       # LSLB=20 00; predicted LSPV≈0D 60
+sudo ./intel-sil-probe --test-low-dim --confirm-hardware-test       # already verified 10 00
+sudo ./intel-sil-probe --test-full-dim --confirm-hardware-test      # already verified 7F FF
 \`\`\`
 
-Each test requires the observed baseline, applies \`LSOO=1\` for only two seconds, restores \`LSLB=FF FF\` **before** \`LSRB=0\`, and polls for return to normal-white telemetry. No arbitrary brightness inputs or persistent Intel dimming are enabled.
+Run **one** test at a time and confirm normal LED brightness has returned before trying the next. Each test requires the observed baseline and restores the original \`LSLB=FF FF\` and normal LED mode. Previous versions restored \`LSLB\` *before* clearing the \`LSOO\` full-on override, briefly producing a maximum-white pulse; the revised diagnostic now calls \`LSRB\` and waits for normal PWM **before** restoring \`LSLB\`. This **new restoration ordering is itself unverified** and must be checked on physical hardware. If anything fails, stop and inspect the LED. Sudden crashes, power loss, and undocumented firmware behavior may prevent recovery.
 
-### Experimental Intel amber/other-mode candidates
+Arbitrary 0–255 Intel brightness and persistent installation remain disabled in normal \`smcled\` until the range and restoration semantics are verified.
 
-**No amber state has been physically verified on the Intel 2018 mini.** The initial \`LSSB=04 00\` candidate produced neither a visible change nor an \`LSPV\` change on the tested machine.
+### Intel amber and white blink findings
 
-The J174 MacEFI boot-signalling routine referenced two \`LSSB\` payloads, \`00 00\` and \`01 00\`, in conjunction with \`LSCS\`. However, the Intel mini does **not** expose \`LSCS\` to macOS, and those payloads are **not** independently identified as amber/color settings. Two further payloads, \`08 00\` and \`09 00\`, produce different amber flash patterns on the M1 mini; their Intel behavior is unknown.
+The Macmini8,1 physically showed **white**, never amber, for the tested normal macOS SMC commands:
 
-The standalone Intel probe offers **separate** opt-in tests (never a color sweep or an automatic suite):
-
-| Command | \`LSSB\` payload | Evidence / expectation |
+| Experiment | \`LSSB\` payload | Actual Intel result |
 |---|---|---|
-| \`--test-amber\` | \`04 00\` | M1 steady amber; already ineffective on Intel |
-| \`--test-amber-fw1\` | \`01 00\` | Seen in J174 EFI boot-signalling code; output unknown |
-| \`--test-amber-fw0\` | \`00 00\` | Seen in J174 EFI boot-signalling code; output unknown |
-| \`--test-amber-blink\` | \`08 00\` | M1 single amber flash; output unknown on Intel |
-| \`--test-amber-double\` | \`09 00\` | M1 double amber flash; output unknown on Intel |
+| \`--test-amber\` | \`04 00\` | No visible change; PWM remains \`14 11\` |
+| \`--test-amber-fw1\` | \`01 00\` | No visible change; PWM remains \`14 11\` |
+| \`--test-amber-fw0\` | \`00 00\` | LED off, PWM \`00 00\`, then white fade back on after restoration |
+| \`--test-amber-blink\` | \`08 00\` | **Single white flash** repeating, full-on PWM \`6B 08\` during flash |
+| \`--test-amber-double\` | \`09 00\` | **Double white flash** repeating, full-on PWM \`6B 08\` during flash |
 
-\`\`\`sh
-./intel-sil-probe --snapshot
-sudo ./intel-sil-probe --test-amber-fw1 --confirm-hardware-test
-# Evaluate results before trying a different value:
-sudo ./intel-sil-probe --test-amber-fw0 --confirm-hardware-test
-\`\`\`
+The firmware-derived \`LSSB=00 00\` and \`01 00\` values were found in the J174 MacEFI boot signalling code alongside \`LSCS\`; that channel-selection key is not macOS-visible on this T2 mini. The values \`08 00\`/\`09 00\` produced the *same blinking rhythms* as on M1 but in **white**, not amber. The \`LSRB=0\` restore successfully returned to \`LSPV=14 11\` and normal white in each test.
 
-Each command requires the verified normal-white baseline, issues **one** bounded two-second SMC experiment, samples \`LSPV\` and \`LSOF\`, attempts restoration with \`LSRB\`, and checks the original PWM. Do **not** run consecutive tests if there is any unexpected LED state or restoration failure. A correct SMC readback is not proof of an amber color; observe the LED directly.
+No working Intel amber/color-selection path has been identified. This **does not prove that the physical LED cannot display amber** in firmware recovery; further independent firmware/hardware analysis is needed. The existing normal \`smcled --amber\` command remains blocked on Intel.
 
-As with all undocumented SMC writes, a crash, power loss or unexpected firmware response can prevent restoration. Nothing is enabled in regular \`smcled --amber\` on Intel until physically validated. This investigation uses independent historical SMC documentation and the J174 EFI image, with **no LuxMini code or private profiles**.
+The standalone probe offers each experimental pattern individually with \`--confirm-hardware-test\`; no automated mode sweep is provided. As always, inspect the real LED rather than inferring its color solely from SMC telemetry.
 
 ## Automatic sunrise/sunset mode
 
