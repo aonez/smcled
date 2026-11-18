@@ -352,6 +352,23 @@ func compatibilitySelfTest() throws {
         throw ToolError("Intel manual override classification self-test failed")
     }
     print("PASS: Intel active brightness override classification")
+    let fadeCases: [(Int, Int)] = [(0, 65535), (65535, 0), (0x2FFF, 0x101),
+                                  (0x101, 0x505), (0x505, 0x505)]
+    for (from, to) in fadeCases {
+        let count = 60
+        let values = (0...count).map {
+            intelFadePreset(from: from, to: to, step: $0, steps: count)
+        }
+        guard values.first == from, values.last == to else {
+            throw ToolError("Intel fade endpoint test failed: \(from) -> \(to)")
+        }
+        for i in 1..<values.count {
+            guard (to >= from ? values[i] >= values[i - 1] : values[i] <= values[i - 1]) else {
+                throw ToolError("Intel fade monotonicity test failed")
+            }
+        }
+    }
+    print("PASS: Intel 16-bit fade endpoints and monotonic steps")
     guard looksLikeModernMacIdentifier("Mac17,9"),
           looksLikeModernMacIdentifier("Mac27,12"),
           !looksLikeModernMacIdentifier("Macmini8,1"),
@@ -769,6 +786,107 @@ func intelWriteBrightness(_ level: UInt8) throws {
         // override or register write behaves unexpectedly.
         do { try intelRestoreSystem(smc) }
         catch { writeStderr("WARNING: automatic Intel recovery failed: \(error). Inspect the LED.\n") }
+        throw error
+    }
+}
+
+// Intel hardware responds immediately to LSLB changes. A fade therefore
+// needs multiple software-paced SMC writes, not one special firmware command.
+// Use the full 16-bit LSLB range for fine steps, particularly below 10/255.
+// This method is intentionally opt-in; immediate brightness stays immediate.
+func intelFadePreset(from start: Int, to end: Int, step: Int, steps: Int) -> Int {
+    let t = Double(step) / Double(steps)
+    let eased = t * t * (3.0 - 2.0 * t)
+    return max(0, min(65535, Int((Double(start) + Double(end - start) * eased).rounded())))
+}
+
+func intelFadeBrightness(_ level: UInt8, duration: TimeInterval = 3.0) throws {
+    guard duration.isFinite, (0.5...15.0).contains(duration) else {
+        throw ToolError("Intel fade duration must be between 0.5 and 15 seconds")
+    }
+    let smc = try SMC()
+    try checkIntelSIL(smc)
+    let (currentPreset, currentPWM, currentOff) = try intelStableState(smc)
+    let wasOff = currentOff == [1]
+    // The normal factory mode has LSPV=14 11. Its equivalent manual
+    // full-on preset is 2F FF, which also predicts LSPV=14 11 exactly.
+    // Use this to enter manual mode without a brightness jump.
+    let wasManual = currentOff == [0] &&
+                    currentPWM.count == 2 &&
+                    abs(intelUnsigned16(currentPWM) - intelPWMExpected(currentPreset)) <= 3 &&
+                    (currentPreset != intelDefaultLSLB || currentPWM != intelNormalPWM)
+    let start = wasOff ? 0 : (wasManual ? intelUnsigned16(currentPreset) : 0x2FFF)
+    let target = Int(level) * 257
+
+    if (wasOff && level == 0) || (wasManual && start == target) {
+        print("Intel fade: requested brightness already active.")
+        return
+    }
+
+    let cancellation = DiagnosticCancellation()
+    let steps = max(20, min(120, Int((duration * 30).rounded())))
+    var activeOverride = wasManual
+    var lastPreset = currentPreset
+    let beginning = Date()
+    do {
+        if !wasOff && !wasManual {
+            // First acquire the manual override at the current factory PWM.
+            // Different from the old manual path that briefly changed level.
+            let matchingNormal: [UInt8] = [0x2F, 0xFF]
+            if lastPreset != matchingNormal {
+                try smc.write("LSLB", bytes: matchingNormal)
+                lastPreset = matchingNormal
+            }
+            try smc.write("LSOO", bytes: [1])
+            activeOverride = true
+        }
+
+        for i in 1...steps {
+            try cancellation.check()
+            let raw = intelFadePreset(from: start, to: target, step: i, steps: steps)
+            if level == 0 && i == steps {
+                // Preserve the confirmed zero/off semantics. An LSLB=0000
+                // override has never been tested and is not needed.
+                try smc.write("LSOO", bytes: [0])
+                activeOverride = false
+            } else if raw > 0 {
+                let next: [UInt8] = [UInt8((raw >> 8) & 0xFF), UInt8(raw & 0xFF)]
+                if lastPreset != next {
+                    try smc.write("LSLB", bytes: next)
+                    lastPreset = next
+                }
+                if !activeOverride {
+                    try smc.write("LSOO", bytes: [1])
+                    activeOverride = true
+                }
+            }
+            // Schedule against the initial time to avoid accumulating SMC
+            // transaction latency in a long series of small changes.
+            let deadline = beginning.addingTimeInterval(
+                duration * Double(i) / Double(steps))
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining > 0 { try cancellation.pause(remaining) }
+        }
+
+        if level == 0 {
+            _ = try intelWaitFor(smc, targetPWM: [0, 0], targetOff: [1],
+                                 maxSeconds: 2)
+        } else {
+            let expected = intelPWMExpected([level, level])
+            let actual = try intelWaitFor(smc, targetPWM: nil, targetOff: [0],
+                                          maxSeconds: 2)
+            guard actual.count == 2,
+                  abs(intelUnsigned16(actual) - expected) <= 3,
+                  try smc.read("LSLB") == [level, level] else {
+                throw ToolError("Intel fade reached unexpected PWM \(hex(actual)); expected near \(expected)")
+            }
+        }
+        print("Intel white brightness faded to \(level)/255 over \(duration)s.")
+        print("Manual mode remains active; use --reset for firmware-controlled white.")
+    } catch {
+        writeStderr("WARNING: Intel fade interrupted or failed: \(error). Attempting system restoration.\n")
+        do { try intelRestoreSystem(smc) }
+        catch { writeStderr("WARNING: Intel fade recovery failed: \(error). Inspect physical LED.\n") }
         throw error
     }
 }
@@ -2059,6 +2177,8 @@ func usage() {
       sudo smcled --off                  Turn LED off (white brightness 0)
       sudo smcled --reset                Default white brightness (255)
       sudo smcled --intel-brightness 50  Intel 2018: custom white brightness 0...255 (experimental)
+      sudo smcled --intel-fade 50 [seconds]
+                                          Intel 2018: smooth 16-bit fade (default 3s)
       sudo smcled --intel-full           Intel 2018: force full-bright white
       sudo smcled --intel-restore        Intel 2018: return to system-controlled white
       smcled --intel-led-status          Intel 2018: read-only SIL state
@@ -2163,6 +2283,26 @@ func run(_ originalArguments: [String]) throws {
     case "--intel-led-status":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --intel-led-status") }
         try intelSILStatus()
+        return
+    case "--intel-fade":
+        guard arguments.count == 2 || arguments.count == 3 else {
+            throw ToolError("Usage: sudo smcled --intel-fade <0...255> [seconds]")
+        }
+        guard modelID() == "Macmini8,1" else {
+            throw ToolError("--intel-fade is only available on Macmini8,1")
+        }
+        let level = try brightnessNumber(arguments[1])
+        let duration: Double
+        if arguments.count == 3 {
+            guard let value = Double(arguments[2]), value.isFinite,
+                  (0.5...15.0).contains(value) else {
+                throw ToolError("Intel fade duration must be 0.5 to 15 seconds")
+            }
+            duration = value
+        } else {
+            duration = 3.0
+        }
+        try intelFadeBrightness(level, duration: duration)
         return
     case "--intel-brightness":
         guard arguments.count == 2 else { throw ToolError("Usage: sudo smcled --intel-brightness <0...255>") }
