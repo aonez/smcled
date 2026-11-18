@@ -38,7 +38,7 @@ The Intel Mac mini has **different SMC LED controls from Apple Silicon**. Physic
 | `sudo ./smcled --reset` (or `--intel-restore`, `--white`) | `LSRB=0`, reset `LSLB=FF FF` | Returns to firmware-controlled normal white with a fade; `LSPV=14 11` |
 | `./smcled --intel-led-status` | Read-only | Prints current Intel LED-related SMC registers |
 
-All three state commands require `sudo`, check the `Macmini8,1` model and exact SMC metadata/calibration, and confirm the observed SMC output. They are **immediate operations** and do **not** install a daemon or persist a boot preference. On the tested unit, `LSLN=2F FF`, `LSSV=08 6B`, and `LS! =00`; if your unit differs, write commands refuse to run until separately validated. A reported SMC state does not substitute for seeing the physical LED respond.
+Intel LED commands require `sudo`, check the `Macmini8,1` model and exact SMC metadata/calibration, and confirm the observed SMC output. **Manual brightness now fades by default**, while `--no-fade` requests an immediate write; `--reset` uses the controller's normal restoration behavior. No Intel commands install a daemon or persist a boot preference. On the tested unit, `LSLN=2F FF`, `LSSV=08 6B`, and `LS! =00`; if your unit differs, write commands refuse to run until separately validated. A reported SMC state does not substitute for seeing the physical LED respond.
 
 **Intel 0–255 manual brightness is experimental.** `sudo ./smcled --intel-brightness 50`, `sudo ./smcled --white 50`, or `sudo ./smcled 50` set a live white PWM level via `LSLB=[value,value]` and `LSOO=1`; `0` uses the separately verified `LSOO=0` off command. `sudo ./smcled --reset` restores firmware-controlled normal white and the original `LSLB=FF FF`. Custom-to-custom updates now write `LSLB` **directly** while the manual override is active; from off, `LSLB` is configured before re-enabling the LED. This avoids the previous intermediate return to firmware-controlled normal brightness, which caused visible flashes at small brightness levels. The revised direct-transition path still needs physical confirmation. These values are not perceptually linear or photometrically calibrated. **Unsupported on Intel:** amber/color selection, `--install`, and `--install-auto`. White blinking tests remain separate from amber. Sleep/wake/restart behavior is untested.
 
@@ -88,19 +88,38 @@ The two patterns confirmed on the physical Intel mini remain available only as e
 
 Each probe displays the pattern briefly, then calls `LSRB` and confirms a return to normal white. Earlier exploratory values `LSSB=04 00` and `01 00` showed no visible change, while `00 00` turned the white LED off; those speculative amber tests have been removed from the probe and are preserved only in historical research notes. No additional color-mode guessing is planned.
 
-### Optional Intel software fade
+### Native and software LED fades
 
-On Apple Silicon, smcled's automatic sunrise/sunset fade already uses software to write intermediate `LSLN` values with **smoothstep** easing. On Intel, the working register is **`LSLB`**, which changes physical brightness immediately. An opt-in, software-generated fade now interpolates the full 16-bit `LSLB` preset, with cancellation handling and final PWM verification. **This fade implementation has not yet been physically tested.**
+**Intel Mac mini 2018:** Regular manual white brightness commands now perform a software fade by default. Duration is **proportional to the actual brightness change**, with 0→255 taking one second:
+
+\[
+\text{duration (seconds)} = |\text{new level}-\text{current level}| / 255
+\]
+
+The Intel hardware reacts immediately to each `LSLB` write, so smcled interpolates its 16-bit PWM preset with smoothstep easing. This interpolation was physically tested successfully at longer, explicit durations before becoming the default; short proportional transitions still require on-device testing. Tiny changes may finish more slowly than the theoretical duration because SMC calls take time.
 
 ```sh
-sudo ./smcled --intel-fade 10         # Smoothly fade to brightness 10 in 3 seconds
-sudo ./smcled --intel-fade 100 1.5    # Fade to 100 over 1.5 seconds
-sudo ./smcled --intel-fade 0 3       # Fade the LED off
-sudo ./smcled --intel-fade 50 5      # A slower 5-second fade
-sudo ./smcled --reset                # Return to firmware-controlled normal white
+sudo ./smcled 20                    # Intel: fade toward brightness 20, proportional duration
+sudo ./smcled 200                   # Intel: same rule regardless of target level
+sudo ./smcled 20 --no-fade          # Intel: direct immediate change
+sudo ./smcled --off                 # Intel: proportional fade to off
+sudo ./smcled --fade 100            # Intel: explicitly request proportional fade
+sudo ./smcled --fade 100 3          # Intel: explicitly request a 3-second software fade
+sudo ./smcled --reset               # Intel: restore firmware-controlled white
 ```
 
-Fade duration accepts `0.5...15` seconds, default `3`. Normal `sudo ./smcled 50` remains **immediate**. A fade to `0` uses the previously verified `LSOO=0` command at the end; all other levels remain manual overrides until another command or `--reset`. As with any undocumented SMC operation, sudden termination or a firmware fault can prevent full restoration.
+**Apple Silicon Mac mini / Studio:** Keep the previously tested **native SMC write behavior by default**. White LED brightness on the tested M1 showed natural smoothing from direct writes; this is distinct from smcled's three-second, **software-driven** sunrise/sunset transitions. We deliberately do not apply a second software fade to ordinary Apple Silicon manual commands. `--no-fade` cannot disable any smoothing intrinsic to the hardware.
+
+```sh
+sudo ./smcled 20                    # Apple Silicon: original native white LED control
+sudo ./smcled --white 100           # Apple Silicon: original native white LED control
+sudo ./smcled --fade 100            # Apple Silicon: single native SMC write on current channel
+sudo ./smcled --fade 100 3          # Apple Silicon: explicit 3-second SOFTWARE fade on current channel
+```
+
+On both architectures, an explicit `--fade <level> [seconds]` with a supplied duration selects software easing. Duration overrides accept `0.01...15` seconds. Without an explicit duration, Intel applies proportional software fading and Apple Silicon uses native hardware behavior. `--fade` preserves the active color channel on Apple Silicon; bare numeric values and `--white` target white as before.
+
+**Automatic mode:** The existing Apple Silicon sunrise/sunset schedule still uses its independently implemented three-second software fades; its timing has *not* been changed. Intel has the PWM fade mechanism needed for a future **white-only** automatic mode, but Intel automation remains disabled pending a separate scheduling and wake/reboot design.
 
 ## Automatic sunrise/sunset mode
 
