@@ -315,7 +315,7 @@ func testAmberCandidate(_ smc: SMC, candidate: UInt8, cancellation: Cancellation
 // PWM preset, and LSOO=1 was physically verified to force full-white on this
 // exact Macmini8,1. Whether modifying LSLB changes physical brightness remains
 // UNKNOWN. A single half-scale value is tried, restored unconditionally.
-func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, low: Bool = false) throws {
+func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, candidate: [UInt8]) throws {
     try checkKey(smc, "LSLB", size: 2, type: "ui16", readable: true, writable: true)
     try checkKey(smc, "LSSV", size: 2, type: "ui16", readable: true, writable: true)
     let original = try smc.read("LSLB")
@@ -327,15 +327,15 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, low: Bo
           try smc.read("LS! ") == [0] else {
         throw TestError("LSLB test requires exact verified normal-white baseline; no SMC writes attempted")
     }
-    // 7F FF produced exactly half the full PWM, but that is still 2.67x
-    // the normal-white PWM. 10 00 should produce ~1/3 of normal PWM.
-    // Only these two bounded profiles are exposed for research.
-    let candidate: [UInt8] = low ? [0x10, 0x00] : [0x7F, 0xFF]
+    // Exactly these four PWM presets were chosen for hardware exploration.
+    // No arbitrary SMC register value can be supplied on the command line.
+    guard [[0x08, 0x00], [0x10, 0x00], [0x20, 0x00], [0x7F, 0xFF]].contains(candidate) else {
+        throw TestError("Unsupported Intel brightness candidate")
+    }
     print("\nUNVERIFIED Intel variable-brightness experiment:")
-    print("  Set LSLB FF FF -> \(hex(candidate)) " +
-          (low ? "(predicted PWM below normal-white)" : "(approximately half of full-white PWM)"))
-    print("  Then invoke verified LSOO=1 for 2s; measure LSPV and observe the physical LED.")
-    print("  Always restore LSLB=FF FF, then LSRB=0 and check normal-white telemetry.")
+    print("  Temporarily set LSLB FF FF -> \(hex(candidate)), then LSOO=1 for 2s.")
+    print("  Monitor LSPV and the physical LED. Restore using LSRB first, then LSLB.")
+    print("  Reordering restoration avoids the briefly forced-full-white pulse found in prior tests.")
     var testFailure: Error?
     do {
         try cancellation.check()
@@ -354,43 +354,72 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, low: Bo
         }
     } catch { testFailure = error }
 
-    // Restore each register independently, even if the other write fails.
-    // Crucially, restore LSLB before LSRB re-enables firmware behavior.
+    // The previous version restored LSLB while LSOO=1 was still active.
+    // That momentarily commanded full white (LSPV=6B 08), causing the
+    // unwanted pulse. Instead, exit full-on override first; only after the
+    // LED is back at normal PWM, restore the full-on preset register.
+    // The alternate order is itself an experimental behavior and has not
+    // yet been physically validated: restore the register on all paths.
     var restorationErrors: [String] = []
-    do { try smc.write("LSLB", bytes: original) }
-    catch {
+    var restoredNormal = false
+    do {
+        try smc.write("LSRB", bytes: [0])
+        let deadline = Date().addingTimeInterval(6.0)
+        repeat {
+            let p = try smc.read("LSPV")
+            let off = try smc.read("LSOF")
+            print("  Restoring mode: LSPV=\(hex(p)) LSOF=\(hex(off))")
+            if p == [0x14, 0x11], off == [0] {
+                restoredNormal = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < deadline
+    } catch {
+        restorationErrors.append("LSRB/normal-state verification: \(error)")
+        err("WARNING: restoring normal LED mode failed: \(error)\n")
+    }
+    // Restore original calibration even if the mode switch didn't complete.
+    do {
+        try smc.write("LSLB", bytes: original)
+        guard try smc.read("LSLB") == original else {
+            throw TestError("LSLB restoration readback mismatch")
+        }
+    } catch {
         restorationErrors.append("LSLB: \(error)")
         err("WARNING: restoring LSLB failed: \(error)\n")
     }
-    do { try smc.write("LSRB", bytes: [0]) }
-    catch {
-        restorationErrors.append("LSRB: \(error)")
-        err("WARNING: restoring normal LED mode failed: \(error)\n")
-    }
-    let deadline = Date().addingTimeInterval(6.0)
-    var restored = false
-    repeat {
+    // If normal-mode restoration was delayed, retry only after the original
+    // LSLB has been restored, and verify again before reporting success.
+    if !restoredNormal {
         do {
-            let p = try smc.read("LSPV")
-            let off = try smc.read("LSOF")
-            let full = try smc.read("LSLB")
-            print("  Restoring: LSLB=\(hex(full)) LSPV=\(hex(p)) LSOF=\(hex(off))")
-            if full == original, p == [0x14, 0x11], off == [0],
-               try smc.read("LSLN") == [0x2F, 0xFF],
-               try smc.read("LS! ") == [0] {
-                restored = true
-                break
-            }
+            try smc.write("LSRB", bytes: [0])
+            let deadline = Date().addingTimeInterval(6)
+            repeat {
+                let p = try smc.read("LSPV")
+                let off = try smc.read("LSOF")
+                print("  Emergency restore: LSPV=\(hex(p)) LSOF=\(hex(off))")
+                if p == [0x14, 0x11], off == [0] {
+                    restoredNormal = true
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.25)
+            } while Date() < deadline
         } catch {
-            restorationErrors.append("verification: \(error)")
-            break
+            restorationErrors.append("emergency LSRB: \(error)")
         }
-        Thread.sleep(forTimeInterval: 0.25)
-    } while Date() < deadline
-    guard restored && restorationErrors.isEmpty else {
-        throw TestError("Full-on brightness test: restoration not confirmed (\(restorationErrors.joined(separator: "; "))); STOP, inspect LED")
     }
-    print("  Original LSLB, normal PWM and LED-on flag confirmed restored.")
+    let finalLSLB = try smc.read("LSLB")
+    let finalPWM = try smc.read("LSPV")
+    let finalOff = try smc.read("LSOF")
+    let finalValid = restoredNormal && finalLSLB == original &&
+                     finalPWM == [0x14, 0x11] && finalOff == [0] &&
+                     (try smc.read("LSLN")) == [0x2F, 0xFF] &&
+                     (try smc.read("LS! ")) == [0]
+    guard finalValid && restorationErrors.isEmpty else {
+        throw TestError("Full-on brightness test: restoration not fully confirmed: LSLB=\(hex(finalLSLB)), LSPV=\(hex(finalPWM)), LSOF=\(hex(finalOff)), errors=\(restorationErrors); STOP and inspect the LED")
+    }
+    print("  Original LSLB and normal LED state confirmed restored.")
     if let testFailure { throw testFailure }
     print("  Hardware telemetry test completed. Please report visible brightness relative to normal/full white.")
 }
@@ -398,7 +427,7 @@ func testFullBrightnessCandidate(_ smc: SMC, cancellation: Cancellation, low: Bo
 func run() throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count == 1 || args.count == 2 else {
-        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--test-amber|--test-amber-fw0|--test-amber-fw1|--test-amber-blink|--test-amber-double|--test-full-dim|--test-low-dim|--suite --confirm-hardware-test")
+        throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-off|--test-on|--test-amber|--test-amber-fw0|--test-amber-fw1|--test-amber-blink|--test-amber-double|--test-full-dim|--test-low-dim|--test-very-low-dim|--test-mid-dim|--suite --confirm-hardware-test")
     }
     guard modelID() == "Macmini8,1" else { throw TestError("Only Macmini8,1 is supported") }
     let smc = try SMC()
@@ -407,7 +436,7 @@ func run() throws {
         return
     }
     guard args.count == 2, args[1] == "--confirm-hardware-test",
-          ["--test-off", "--test-on", "--test-amber", "--test-amber-fw0", "--test-amber-fw1", "--test-amber-blink", "--test-amber-double", "--test-full-dim", "--test-low-dim", "--suite"].contains(args[0]) else {
+          ["--test-off", "--test-on", "--test-amber", "--test-amber-fw0", "--test-amber-fw1", "--test-amber-blink", "--test-amber-double", "--test-full-dim", "--test-low-dim", "--test-very-low-dim", "--test-mid-dim", "--suite"].contains(args[0]) else {
         throw TestError("Invalid command or missing explicit confirmation")
     }
     try preflight(smc)
@@ -433,9 +462,16 @@ func run() throws {
             "--test-amber-blink": 8, "--test-amber-double": 9
         ]
         try testAmberCandidate(smc, candidate: candidates[args[0]]!, cancellation: cancellation)
-    } else if args[0] == "--test-full-dim" || args[0] == "--test-low-dim" {
+    } else if ["--test-full-dim", "--test-low-dim",
+               "--test-very-low-dim", "--test-mid-dim"].contains(args[0]) {
+        let candidateByCommand: [String: [UInt8]] = [
+            "--test-full-dim": [0x7F, 0xFF],
+            "--test-low-dim": [0x10, 0x00],
+            "--test-very-low-dim": [0x08, 0x00],
+            "--test-mid-dim": [0x20, 0x00]
+        ]
         try testFullBrightnessCandidate(smc, cancellation: cancellation,
-                                        low: args[0] == "--test-low-dim")
+                                        candidate: candidateByCommand[args[0]]!)
     } else {
         let commands: [UInt8] = args[0] == "--suite" ? [0, 1] : [args[0] == "--test-off" ? 0 : 1]
         for value in commands { try test(smc, command: value, cancellation: cancellation) }
