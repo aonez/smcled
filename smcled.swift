@@ -1251,15 +1251,13 @@ func installedUserCLILink() throws -> Bool {
 
 func manageUserCLILink(remove: Bool = false) throws {
     try requireUnprivilegedUser()
-    let installedDirValid = try validateManagedPath(installDirectory, directory: true)
-    guard installedDirValid else {
-        throw ToolError("Install smcled first using sudo ./smcled --install-auto")
-    }
     if !remove {
-        guard try validateManagedPath(installedExecutable, directory: false) else {
-            throw ToolError("Installed smcled executable not found; run sudo ./smcled --install-auto")
+        guard try validateManagedPath(installDirectory, directory: true),
+              try validateManagedPath(installedExecutable, directory: false) else {
+            throw ToolError("Install smcled first using sudo ./smcled --install-auto")
         }
     }
+    // Removal must work even after --uninstall deleted the protected binary.
     let local = NSHomeDirectory() + "/.local"
     let bin = local + "/bin"
     _ = try ensurePrivateUserDirectory(local, create: !remove)
@@ -1288,7 +1286,8 @@ func manageUserCLILink(remove: Bool = false) throws {
     print("User CLI link: \(link)")
     print("Add to ~/.zprofile if needed: export PATH=\"$HOME/.local/bin:$PATH\"")
     print("Use smcled --status or smcled --auto-preview without sudo.")
-    print("For privileged operations, use: sudo \"$HOME/.local/bin/smcled\" --auto-check")
+    print("For privileged operations, use the protected absolute executable:")
+    print("  sudo \"\(installedExecutable)\" --auto-check")
 }
 
 func executableSource() throws -> String {
