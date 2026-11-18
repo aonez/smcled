@@ -119,7 +119,7 @@ sudo ./smcled --fade 100 3          # Apple Silicon: explicit 3-second SOFTWARE 
 
 On both architectures, an explicit `--fade <level> [seconds]` with a supplied duration selects software easing. Duration overrides accept `0.01...15` seconds. Without an explicit duration, Intel applies proportional software fading and Apple Silicon uses native hardware behavior. `--fade` preserves the active color channel on Apple Silicon; bare numeric values and `--white` target white as before.
 
-**Automatic mode:** Apple Silicon keeps the existing sunrise/sunset scheduler and its three-second software fades unchanged. The Intel Mac mini now uses the same six scheduled brightness targets with **white only** (including originally amber stages), applying its previously tested proportional software fade. The Intel startup/periodic installation path is implemented but still requires on-device validation, particularly across reboot and sleep/wake.
+**Automatic mode:** Apple Silicon keeps the existing sunrise/sunset scheduler and its three-second software fades unchanged. The Intel Mac mini uses its own **seven-stage white-only** brightness schedule, applying its previously tested proportional software fade. The Intel startup/periodic installation path is implemented but still requires on-device validation, particularly across reboot and sleep/wake.
 
 ## Automatic sunrise/sunset mode
 
@@ -153,12 +153,26 @@ sudo ./smcled --auto-check        # Apply the current scheduled state once
 sudo ./smcled --install-auto      # Install checks every 300 seconds
 sudo ./smcled --install-auto 60   # Alternative: check every 60 seconds (30...86400)
 ./smcled --status                # Report auto mode, interval, and loaded service
-sudo smcled --uninstall           # Stop automation and restore native LED behavior
+sudo ./smcled --uninstall          # Stop automation and restore native LED behavior
 ```
 
 `--install-auto` creates a root-owned **one-shot system LaunchDaemon**, launched at startup and periodically (`StartInterval` defaults to 300 seconds). You can change the interval by running the install command again. When the LED resets after sleep or reboot, the next successful auto check should reapply the current scheduled level; transitions may lag by roughly the selected interval, and there is no resident wake listener.
 
-**Intel-specific limitations:** `--install-auto` is permitted on the verified `Macmini8,1` SMC fingerprint and always uses white. Fixed installs such as `sudo ./smcled --install white 50` remain disabled, and no Intel amber commands are issued. Installation, scheduled execution, wake recovery and uninstall have not yet been physically validated on Intel, even though the underlying manual white brightness/fade controls have been. Use `sudo smcled --uninstall` to stop the service and restore firmware-controlled white.
+### Homebrew-managed or user-owned `/usr/local/bin`
+
+Some Intel Macs have a user-owned `/usr/local/bin` directory (often managed by Homebrew). smcled **never changes its ownership or permissions**. For security, it skips its optional `/usr/local/bin/smcled` symlink when that directory is absent, user-owned, or writable by non-root accounts. That condition **does not prevent installation** of the root-owned binary and LaunchDaemon, which invoke the binary by its absolute path.
+
+If the installer reports that the PATH link was skipped, continue using the locally compiled `./smcled`, or call the installed executable directly (quotes are required due to the space in the path):
+
+```sh
+sudo "/Library/Application Support/smcled/smcled" --auto-check
+"/Library/Application Support/smcled/smcled" --status
+sudo "/Library/Application Support/smcled/smcled" --uninstall
+```
+
+Do **not** `chown` or `chmod` `/usr/local/bin` merely to create the optional link. A secure installation does not require that link, and `--status` explicitly reports whether it was installed or skipped.
+
+**Intel-specific limitations:** `--install-auto` is permitted on the verified `Macmini8,1` SMC fingerprint and always uses white. Fixed installs such as `sudo ./smcled --install white 50` remain disabled, and no Intel amber commands are issued. Installation, scheduled execution, wake recovery and uninstall have not yet been physically validated on Intel, even though the underlying manual white brightness/fade controls have been. Use `sudo ./smcled --uninstall` to stop the service and restore firmware-controlled white.
 
 Solar times are calculated offline using the city configured in macOS (`/Library/Preferences/.GlobalPreferences.plist`), with CoreBrightness as a fallback. No location permission is needed. These are undocumented system interfaces and could change in future macOS releases.
 
