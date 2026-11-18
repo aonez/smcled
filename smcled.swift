@@ -345,6 +345,13 @@ func compatibilitySelfTest() throws {
         throw ToolError("Intel 0...255 level scaling self-test failed")
     }
     print("PASS: Intel 0...255 PWM mapping matches hardware samples within 3 counts")
+    guard intelManualOverrideActive(preset: [10, 10], pwm: [0x04, 0x32], off: [0]),
+          intelManualOverrideActive(preset: [50, 50], pwm: [0x14, 0xFD], off: [0]),
+          !intelManualOverrideActive(preset: [0xFF, 0xFF], pwm: intelNormalPWM, off: [0]),
+          !intelManualOverrideActive(preset: [10, 10], pwm: [0, 0], off: [1]) else {
+        throw ToolError("Intel manual override classification self-test failed")
+    }
+    print("PASS: Intel active brightness override classification")
     guard looksLikeModernMacIdentifier("Mac17,9"),
           looksLikeModernMacIdentifier("Mac27,12"),
           !looksLikeModernMacIdentifier("Macmini8,1"),
@@ -627,6 +634,13 @@ func intelPWMExpected(_ brightnessPreset: [UInt8]) -> Int {
     (intelUnsigned16(brightnessPreset) * 0x6B08 + 0x7FFF) / 0xFFFF
 }
 
+func intelManualOverrideActive(preset: [UInt8], pwm: [UInt8], off: [UInt8]) -> Bool {
+    // Under manual LSOO=1, live PWM follows the current LSLB calibration.
+    // Both initial brightness and the persistent override must be checked.
+    off == [0] && pwm != intelNormalPWM && pwm.count == 2 &&
+        abs(intelUnsigned16(pwm) - intelPWMExpected(preset)) <= 3
+}
+
 func intelStableState(_ smc: SMC) throws -> ([UInt8], [UInt8], [UInt8]) {
     // Sample twice to avoid treating an active flash or fading transition as
     // a steady state. This is a guard, not proof that no external writer exists.
@@ -640,11 +654,9 @@ func intelStableState(_ smc: SMC) throws -> ([UInt8], [UInt8], [UInt8]) {
     guard pwm == pwmAgain, off == offAgain else {
         throw ToolError("Intel LED output is changing (possibly fading or blinking); retry when stable")
     }
-    let scaled = intelPWMExpected(preset)
     let isOff = off == [1] && pwm == [0, 0]
     let isNormal = off == [0] && pwm == intelNormalPWM
-    let isOverride = off == [0] && pwm.count == 2 &&
-                     abs(intelUnsigned16(pwm) - scaled) <= 3
+    let isOverride = intelManualOverrideActive(preset: preset, pwm: pwm, off: off)
     guard isOff || isNormal || isOverride else {
         throw ToolError("Intel LED state not recognized (LSLB=\(hex(preset)), LSPV=\(hex(pwm)), LSOF=\(hex(off))); refusing write")
     }
@@ -668,8 +680,15 @@ func intelWaitFor(_ smc: SMC, targetPWM: [UInt8]?,
 func intelRestoreSystem(_ smc: SMC) throws {
     // Restore the *mode* first; restoring LSLB while full-on override is
     // active visibly pulses the LED at maximum brightness.
-    try smc.write("LSRB", bytes: [0])
-    _ = try intelWaitFor(smc, targetPWM: intelNormalPWM, targetOff: [0], maxSeconds: 6)
+    // Already at normal PWM? Don't restart a fade or cause a visible pulse.
+    // A custom full-on preset can be restored without changing output when
+    // firmware-controlled mode is already active.
+    let currentPWM = try smc.read("LSPV")
+    let currentOff = try smc.read("LSOF")
+    if currentPWM != intelNormalPWM || currentOff != [0] {
+        try smc.write("LSRB", bytes: [0])
+        _ = try intelWaitFor(smc, targetPWM: intelNormalPWM, targetOff: [0], maxSeconds: 6)
+    }
     if try smc.read("LSLB") != intelDefaultLSLB {
         try smc.write("LSLB", bytes: intelDefaultLSLB)
         guard try smc.read("LSLB") == intelDefaultLSLB else {
@@ -686,27 +705,45 @@ func intelRestoreSystem(_ smc: SMC) throws {
 func intelWriteBrightness(_ level: UInt8) throws {
     let smc = try SMC()
     try checkIntelSIL(smc)
-    let _ = try intelStableState(smc)
+    let (existingPreset, existingPWM, existingOff) = try intelStableState(smc)
     if level == 0 {
-        // Use physically verified off command; 0-valued LSLB full-on
-        // semantics have not been tested on this T2 firmware.
-        try smc.write("LSOO", bytes: [0])
-        _ = try intelWaitFor(smc, targetPWM: [0, 0], targetOff: [1], maxSeconds: 2)
+        // Off is a known separate firmware command, not a 16-bit PWM level.
+        // Preserve the current LSLB preset while off so that off->custom can
+        // set the next level without showing the factory brightness first.
+        if existingOff != [1] {
+            try smc.write("LSOO", bytes: [0])
+            _ = try intelWaitFor(smc, targetPWM: [0, 0], targetOff: [1], maxSeconds: 2)
+        }
         print("Intel LED off (level 0). Run --reset for normal system brightness.")
         return
     }
-    // Switching to normal before changing the full-on preset prevents a
-    // flash of maximum brightness when moving between custom levels.
-    try intelRestoreSystem(smc)
+
     let preset: [UInt8] = [level, level]
+    let alreadyOverridden = intelManualOverrideActive(
+        preset: existingPreset, pwm: existingPWM, off: existingOff)
+    // LSLB is the *active* PWM preset when LSOO=1. Earlier tests showed
+    // that changing it while overridden updates the LED immediately.
+    // Avoid calling LSRB + LSOO for custom->custom, which created a pulse
+    // to the normal firmware brightness (particularly obvious at levels 1–20).
+    // If the LED is off or normally controlled, update LSLB first, then
+    // engage LSOO=1 once. This avoids a factory-brightness flash from off.
+    if alreadyOverridden && existingPreset == preset {
+        print("Intel white brightness \(level)/255 already active: LSLB=\(hex(preset)), LSPV=\(hex(existingPWM)).")
+        return
+    }
     do {
-        try smc.write("LSLB", bytes: preset)
-        guard try smc.read("LSLB") == preset else {
-            throw ToolError("Intel LSLB write did not read back correctly")
+        if existingPreset != preset {
+            try smc.write("LSLB", bytes: preset)
+            guard try smc.read("LSLB") == preset else {
+                throw ToolError("Intel LSLB write did not read back correctly")
+            }
         }
-        try smc.write("LSOO", bytes: [1])
-        // Allow fixed-point round-off. The 1...255 range is unverified:
-        // do not treat the value as physically calibrated brightness.
+        if !alreadyOverridden {
+            try smc.write("LSOO", bytes: [1])
+        }
+
+        // Allow fixed-point round-off. The full 1...255 range is experimental:
+        // internal PWM values are not physical brightness measurements.
         let expected = intelPWMExpected(preset)
         let deadline = Date().addingTimeInterval(2)
         var reached = false
@@ -728,6 +765,8 @@ func intelWriteBrightness(_ level: UInt8) throws {
         print("Experimental manual level; run --reset to restore normal firmware brightness.")
     } catch {
         writeStderr("WARNING: Intel level change failed; attempting normal-state restoration: \(error)\n")
+        // Return to verified system-controlled brightness if the active
+        // override or register write behaves unexpectedly.
         do { try intelRestoreSystem(smc) }
         catch { writeStderr("WARNING: automatic Intel recovery failed: \(error). Inspect the LED.\n") }
         throw error
