@@ -158,9 +158,9 @@ sudo ./smcled --uninstall          # Stop automation and restore native LED beha
 
 `--install-auto` creates a root-owned **one-shot system LaunchDaemon**, launched at startup and periodically (`StartInterval` defaults to 300 seconds). You can change the interval by running the install command again. When the LED resets after sleep or reboot, the next successful auto check should reapply the current scheduled level; transitions may lag by roughly the selected interval, and there is no resident wake listener.
 
-### Per-user command in `~/.local/bin`
+### Command-line shortcut
 
-`sudo ./smcled --install-auto` installs the protected LaunchDaemon executable at `/Library/Application Support/smcled/smcled` and **automatically** creates `~/.local/bin/smcled` for the user who invoked `sudo`. User-directory operations run with that user's permissions, never as root.
+`sudo ./smcled --install-auto` installs the protected LaunchDaemon executable at `/Library/Application Support/smcled/smcled` and prefers a managed `/usr/local/bin/smcled` shortcut when its directory is root-owned, protected from group/world writes, and the name is available or already managed. Otherwise it creates `~/.local/bin/smcled` for the user who invoked `sudo`. User-directory operations run with that user's permissions, never as root.
 
 If a new zsh login/interactive shell does not already include `~/.local/bin` in its PATH, the installer appends the following line once to the user's `~/.zprofile`, without overwriting the file:
 
@@ -168,7 +168,7 @@ If a new zsh login/interactive shell does not already include `~/.local/bin` in 
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Open a new Terminal window if PATH was updated. The installer never needs to inspect, chown, or modify `/usr/local/bin`, so Homebrew ownership is not an obstacle. Existing unrelated `~/.local/bin/smcled` files or symlinks are never overwritten.
+Open a new Terminal window if PATH was updated. A Homebrew-owned directory triggers the per-user fallback. Existing unrelated `~/.local/bin/smcled` files or symlinks are never overwritten.
 
 You can set up or remove the shortcut independently, **without sudo**:
 

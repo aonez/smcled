@@ -838,7 +838,7 @@ func intelStableState(_ smc: SMC) throws -> ([UInt8], [UInt8], [UInt8]) {
     return (preset, pwm, off)
 }
 
-func intelWaitFor(_ smc: SMC, targetPWM: [UInt8]?,
+func intelWaitFor(_ smc: SMC, targetPWM: [UInt8], tolerance: Int = 0,
                   targetOff: [UInt8], maxSeconds: TimeInterval) throws -> [UInt8] {
     let deadline = Date().addingTimeInterval(maxSeconds)
     var pwm: [UInt8] = []
@@ -846,7 +846,8 @@ func intelWaitFor(_ smc: SMC, targetPWM: [UInt8]?,
     repeat {
         pwm = try smc.read("LSPV")
         off = try smc.read("LSOF")
-        if off == targetOff, targetPWM == nil || pwm == targetPWM { return pwm }
+        if off == targetOff, pwm.count == 2,
+           abs(intelUnsigned16(pwm) - intelUnsigned16(targetPWM)) <= tolerance { return pwm }
         Thread.sleep(forTimeInterval: 0.2)
     } while Date() < deadline
     throw ToolError("Intel LED did not reach requested state within \(maxSeconds)s (LSPV=\(hex(pwm)), LSOF=\(hex(off)))")
@@ -1055,7 +1056,8 @@ func intelFadeBrightness(_ level: UInt8, duration explicitDuration: TimeInterval
                                  maxSeconds: 2)
         } else {
             let expected = intelPWMExpected([level, level])
-            let actual = try intelWaitFor(smc, targetPWM: nil, targetOff: [0],
+            let actual = try intelWaitFor(smc, targetPWM: [UInt8(expected >> 8), UInt8(expected & 255)],
+                                          tolerance: 3, targetOff: [0],
                                           maxSeconds: 2)
             guard actual.count == 2,
                   abs(intelUnsigned16(actual) - expected) <= 3,
@@ -1434,33 +1436,60 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     let _ = try validateManagedPath(brightnessPreference, directory: false)
     let _ = try validateManagedPath(modePreference, directory: false)
     let _ = try validateManagedPath(daemonPlist, directory: false)
-    // Do not inspect or modify /usr/local/bin: it may be user-owned by Homebrew.
-    // Set up ~/.local/bin only after the protected binary is installed, as the user.
-
-    // A reload is needed if the binary or plist changes.
-    if jobIsLoaded() {
-        _ = try callLaunchctl(["bootout", "system/" + jobLabel])
-    }
-
     let source = try executableSource()
-    if URL(fileURLWithPath: source).resolvingSymlinksInPath().path !=
-       URL(fileURLWithPath: installedExecutable).resolvingSymlinksInPath().path {
-        let binary = try Data(contentsOf: URL(fileURLWithPath: source))
-        try writeManagedFile(installedExecutable, data: binary, executable: true)
+    let replacingBinary = URL(fileURLWithPath: source).resolvingSymlinksInPath().path != installedExecutable
+    var replacements: [(String, Data)] = []
+    if replacingBinary {
+        replacements.append((installedExecutable, try Data(contentsOf: URL(fileURLWithPath: source))))
     }
-    try writeManagedFile(brightnessPreference, data: Data("\(brightness)\n".utf8))
-    try writeManagedFile(modePreference, data: Data("\(automatic ? "auto" : mode.rawValue)\n".utf8))
-    let needsExperimentalAcknowledgment = !intel && !physicallyTestedDesktops.contains(modelID())
-    try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval,
-                                                          acknowledged: needsExperimentalAcknowledgment))
-    // A previously disabled service must be re-enabled explicitly.
-    _ = try callLaunchctl(["enable", "system/" + jobLabel])
-    _ = try callLaunchctl(["bootstrap", "system", daemonPlist])
-    var userCLIInstalled = false
+    let acknowledge = !intel && !physicallyTestedDesktops.contains(modelID())
+    replacements += [
+        (brightnessPreference, Data("\(brightness)\n".utf8)),
+        (modePreference, Data("\(automatic ? "auto" : mode.rawValue)\n".utf8)),
+        (daemonPlist, try createPlistData(automatic: automatic, interval: interval, acknowledged: acknowledge))
+    ]
+    let backups: [Data?] = try replacements.map { path, _ in
+        try validateManagedPath(path, directory: false) ? Data(contentsOf: URL(fileURLWithPath: path)) : nil
+    }
+    let wasLoaded = jobIsLoaded()
+    if wasLoaded { _ = try callLaunchctl(["bootout", "system/" + jobLabel]) }
+    var attempted = 0
     do {
-        userCLIInstalled = try runUserCLISetup()
+        for (path, bytes) in replacements {
+            attempted += 1
+            try writeManagedFile(path, data: bytes, executable: path == installedExecutable)
+        }
+        _ = try callLaunchctl(["enable", "system/" + jobLabel])
+        _ = try callLaunchctl(["bootstrap", "system", daemonPlist])
     } catch {
-        writeStderr("WARNING: LaunchDaemon installed, but user CLI setup failed: \(error)\n")
+        for i in (0..<attempted).reversed() {
+            let path = replacements[i].0
+            do {
+                if let bytes = backups[i] {
+                    try writeManagedFile(path, data: bytes, executable: path == installedExecutable)
+                } else if fm.fileExists(atPath: path) {
+                    try fm.removeItem(atPath: path)
+                }
+            } catch { writeStderr("Could not restore \(path): \(error)\n") }
+        }
+        if wasLoaded {
+            do { _ = try callLaunchctl(["bootstrap", "system", daemonPlist]) }
+            catch { writeStderr("Could not reload previous daemon: \(error)\n") }
+        }
+        if !exists, (try? fm.contentsOfDirectory(atPath: installDirectory).isEmpty) == true {
+            try? fm.removeItem(atPath: installDirectory)
+        }
+        throw error
+    }
+    var systemCLIInstalled = false
+    var userCLIInstalled = false
+    if canManageCLILink() {
+        do { try installCLILink(); systemCLIInstalled = true }
+        catch { writeStderr("System CLI unavailable: \(error)\n") }
+    }
+    if !systemCLIInstalled {
+        do { userCLIInstalled = try runUserCLISetup() }
+        catch { writeStderr("WARNING: LaunchDaemon installed, but user CLI setup failed: \(error)\n") }
     }
 
     // RunAtLoad already starts the automatic fade. Do NOT duplicate that work
@@ -1470,7 +1499,9 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
           ? "Installed \(jobLabel); \(intel ? "Intel white-only" : "white/amber") automatic sunrise/sunset mode (every \(interval) seconds)."
           : "Installed \(jobLabel); saved mode \(mode.rawValue), brightness \(brightness).")
     print("Boot-time job: \(daemonPlist)")
-    if userCLIInstalled {
+    if systemCLIInstalled {
+        print("Shell command: \(cliLink)")
+    } else if userCLIInstalled {
         print("Shell command: ~/.local/bin/smcled (open a new Terminal if PATH was updated)")
     } else {
         print("User CLI not installed; run ./smcled --install-user-cli without sudo.")
@@ -1567,7 +1598,7 @@ func uninstallBrightness() throws {
     let _ = try validateManagedPath(daemonPlist, directory: false)
     // Do not inspect or mutate user-owned PATH directories during uninstall.
     let manageCLILink = canManageCLILink()
-    let hasCLILink = manageCLILink ? (try validateCLILink()) : false
+    let hasCLILink = manageCLILink && ( (try? validateCLILink()) == true )
 
     if jobIsLoaded() {
         _ = try callLaunchctl(["bootout", "system/" + jobLabel])
@@ -1618,7 +1649,7 @@ func installationStatus() throws {
         }
     }
     if canManageCLILink() {
-        print("CLI PATH link: \((try validateCLILink()) ? cliLink : "not installed")")
+        print("CLI PATH link: \((try? validateCLILink()) == true ? cliLink : "not installed")")
     } else {
         print("CLI PATH link: skipped (missing or non-root-owned \(cliBinDirectory))")
         if binary { print("Installed CLI: \(installedExecutable)") }
@@ -2626,9 +2657,9 @@ func testZeroBrightness() throws {
 func usage() {
     // Do not manually align text inside a multiline literal: long commands
     // collide with the description column, and terminal fonts/windows vary.
-    // Keep a fixed command column and wrap descriptions to 88 characters.
+    // Keep a fixed command column and wrap descriptions to 80 characters.
     let columnWidth = 36
-    let maxLineWidth = 88
+    let maxLineWidth = 80
 
     func section(_ heading: String) {
         print("\n\(heading)")
@@ -2640,7 +2671,7 @@ func usage() {
         if !shortCommand { print(commandLine) }
         let prefix: String = shortCommand
             ? commandLine + String(repeating: " ", count: columnWidth - command.count)
-            : "      "
+            : String(repeating: " ", count: columnWidth + 2)
         let continuation = String(repeating: " ", count: prefix.count)
         var line = prefix
         for word in description.split(separator: " ") {
@@ -2691,8 +2722,8 @@ func usage() {
     option("sudo smcled --install amber-blink 50", "Apple Silicon only: persist single amber flashing.")
     option("sudo smcled --install amber-double 50", "Apple Silicon only: persist double amber flashing.")
     print("  On Intel, only --install-auto is supported; fixed modes are blocked.")
-    print("  Installation configures ~/.local/bin for the invoking sudo user; /usr/local/bin is untouched.")
-    print("  The protected executable remains at /Library/Application Support/smcled/smcled.")
+    print("  CLI path: /usr/local/bin when available, otherwise ~/.local/bin.")
+    print("  Daemon executable: /Library/Application Support/smcled/smcled.")
 
     section("COMPATIBILITY AND READ-ONLY TOOLS")
     option("smcled --compatibility", "Show recognized LED SMC key profile and model support.")
@@ -2774,6 +2805,18 @@ func run(_ originalArguments: [String]) throws {
     }
     if ["--help", "help", "-h"].contains(command) { usage(); return }
     if command == "model" { print(modelID()); return }
+    #if os(macOS)
+    let readOnly = ["--compatibility", "--compatibility-self-test", "--intel-led-status",
+                    "--intel-snapshot", "--sample-brightness", "--auto-preview", "--status",
+                    "info", "read", "scan", "--install-user-cli", "--uninstall-user-cli"]
+    var lockFD: Int32 = -1
+    if geteuid() == 0 && !readOnly.contains(command) {
+        // Hold through final readback and recovery. launchd children take their own lock.
+        lockFD = open("/private/var/run/smcled.lock", O_RDWR | O_CREAT | O_EXLOCK | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard lockFD >= 0 else { throw ToolError("Cannot lock LED controller: errno \(errno)") }
+    }
+    defer { if lockFD >= 0 { close(lockFD) } }
+    #endif
     switch command {
     case "--compatibility":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility") }

@@ -440,6 +440,12 @@ func run() throws {
     guard standardTest || customLevel != nil else {
         throw TestError("Usage: ./intel-sil-probe --snapshot | sudo ./intel-sil-probe --test-brightness <0...255> --confirm-hardware-test | sudo ./intel-sil-probe <existing-test> --confirm-hardware-test")
     }
+    guard geteuid() == 0 else { throw TestError("Run hardware tests with sudo") }
+    #if os(macOS)
+    let lockFD = open("/private/var/run/smcled.lock", O_RDWR | O_CREAT | O_EXLOCK | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    guard lockFD >= 0 else { throw TestError("Cannot lock LED controller: errno \(errno)") }
+    defer { close(lockFD) }
+    #endif
     try preflight(smc)
     let cancellation = Cancellation()
     snapshot(smc, heading: "Baseline before experimental on/off control:")
