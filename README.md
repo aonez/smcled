@@ -46,7 +46,7 @@ All three state commands require \`sudo\`, check the \`Macmini8,1\` model and ex
 
 On the tested Intel Mac, writing \`LSLN\` changed the firmware's \`LSPV\` readings but did **not** visibly dim the LED. Changing \`LSLB\` (historically the full-on PWM preset) from \`FF FF\` to \`7F FF\`, followed by \`LSOO=1\`, produced a stable \`LSPV=35 84\`, exactly half the full-on \`6B 08\` value. The user observed two brightness changes (up to test level and down to normal), but **did not yet confirm sub-normal dimming**.
 
-To investigate brightness lower than normal, a separately gated experiment uses \`LSLB=10 00\`, predicted to produce PWM around \`06 D0\` (below normal \`14 11\`). This is a prediction; the physical effect remains unknown.
+To investigate brightness lower than normal, a separately gated experiment uses \`LSLB=10 00\`, predicted to produce PWM around \`06 B0\` (below normal \`14 11\`). This is a prediction; the physical effect remains unknown.
 
 \`\`\`sh
 swiftc -O smcled-intel-lsoo-probe.swift -framework IOKit -o intel-sil-probe
