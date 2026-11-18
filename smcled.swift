@@ -1201,6 +1201,96 @@ func installCLILink() throws {
     guard try validateCLILink() else { throw ToolError("Failed to create managed PATH symlink") }
 }
 
+// Per-user convenience link. Create it WITHOUT sudo: user-controlled
+// ~/.local/bin must never become a root-owned or trusted command directory.
+// The system LaunchDaemon continues to run installedExecutable absolutely.
+func userCLILinkPath() -> String {
+    NSHomeDirectory() + "/.local/bin/smcled"
+}
+
+func requireUnprivilegedUser() throws {
+    guard geteuid() != 0 else {
+        throw ToolError("Run this command WITHOUT sudo; ~/.local/bin is a per-user directory")
+    }
+}
+
+func ensurePrivateUserDirectory(_ path: String, create: Bool) throws -> Bool {
+    var attrs = stat()
+    if lstat(path, &attrs) == 0 {
+        guard (attrs.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
+              attrs.st_uid == geteuid() else {
+            throw ToolError("Refusing non-user-owned directory or symlink: \(path)")
+        }
+        return true
+    }
+    guard errno == ENOENT else {
+        throw ToolError("Cannot inspect user directory \(path): errno \(errno)")
+    }
+    guard create else { return false }
+    try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
+    return try ensurePrivateUserDirectory(path, create: false)
+}
+
+func installedUserCLILink() throws -> Bool {
+    let link = userCLILinkPath()
+    var attrs = stat()
+    if lstat(link, &attrs) != 0 {
+        if errno == ENOENT { return false }
+        throw ToolError("Cannot inspect user CLI link \(link): errno \(errno)")
+    }
+    guard (attrs.st_mode & mode_t(S_IFMT)) == mode_t(S_IFLNK),
+          attrs.st_uid == geteuid() else {
+        throw ToolError("Refusing unrelated or non-user-owned file at \(link)")
+    }
+    let target = try FileManager.default.destinationOfSymbolicLink(atPath: link)
+    guard target == installedExecutable else {
+        throw ToolError("Refusing unrelated symlink at \(link) -> \(target)")
+    }
+    return true
+}
+
+func manageUserCLILink(remove: Bool = false) throws {
+    try requireUnprivilegedUser()
+    let installedDirValid = try validateManagedPath(installDirectory, directory: true)
+    guard installedDirValid else {
+        throw ToolError("Install smcled first using sudo ./smcled --install-auto")
+    }
+    if !remove {
+        guard try validateManagedPath(installedExecutable, directory: false) else {
+            throw ToolError("Installed smcled executable not found; run sudo ./smcled --install-auto")
+        }
+    }
+    let local = NSHomeDirectory() + "/.local"
+    let bin = local + "/bin"
+    _ = try ensurePrivateUserDirectory(local, create: !remove)
+    let binExists = try ensurePrivateUserDirectory(bin, create: !remove)
+    guard binExists else {
+        print("No per-user smcled link installed.")
+        return
+    }
+    let link = userCLILinkPath()
+    let present = try installedUserCLILink()
+    if remove {
+        if present {
+            try FileManager.default.removeItem(atPath: link)
+            print("Removed user CLI link: \(link)")
+        } else {
+            print("No per-user smcled link installed.")
+        }
+        return
+    }
+    if !present {
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: installedExecutable)
+    }
+    guard try installedUserCLILink() else {
+        throw ToolError("Could not verify the per-user smcled symlink")
+    }
+    print("User CLI link: \(link)")
+    print("Add to ~/.zprofile if needed: export PATH=\"$HOME/.local/bin:$PATH\"")
+    print("Use smcled --status or smcled --auto-preview without sudo.")
+    print("For privileged operations, use: sudo \"$HOME/.local/bin/smcled\" --auto-check")
+}
+
 func executableSource() throws -> String {
     // Works when invoked as ./smcled, by absolute path, or through a shell PATH.
     if let url = Bundle.main.executableURL { return url.standardizedFileURL.path }
@@ -1323,6 +1413,7 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
         print("PATH symlink skipped: \(cliBinDirectory) is absent or not a trusted root-owned directory.")
         print("Use the installed executable: sudo \"\(installedExecutable)\" <command>")
         print("Do not change ownership of \(cliBinDirectory) just to install smcled.")
+        print("To create a per-user command, run without sudo: ./smcled --install-user-cli")
     }
 }
 
@@ -1449,6 +1540,16 @@ func installationStatus() throws {
     let plist = try validateManagedPath(daemonPlist, directory: false)
     print("Install: \(dir && binary && config && plist ? "complete" : "incomplete / not installed")")
     print("launchd loaded: \(jobIsLoaded() ? "yes" : "no")")
+    if geteuid() != 0 {
+        let homeLocal = NSHomeDirectory() + "/.local"
+        let homeBin = homeLocal + "/bin"
+        if (try? ensurePrivateUserDirectory(homeLocal, create: false)) == true &&
+           (try? ensurePrivateUserDirectory(homeBin, create: false)) == true {
+            print("User CLI link: \((try? installedUserCLILink()) == true ? userCLILinkPath() : "not installed")")
+        } else {
+            print("User CLI link: not installed")
+        }
+    }
     if canManageCLILink() {
         print("CLI PATH link: \((try validateCLILink()) ? cliLink : "not installed")")
     } else {
@@ -2514,6 +2615,8 @@ func usage() {
     option("sudo smcled --auto-check", "Apply the current solar target once; no installation.")
     option("sudo smcled --install-auto [seconds]", "Install a periodic LaunchDaemon; 300s default, 30...86400s allowed. Intel: 7 white-only events; Apple Silicon: 6 white/amber events.")
     option("smcled --status", "Show saved preferences, daemon state, interval and optional PATH link.")
+    option("smcled --install-user-cli", "Without sudo: create ~/.local/bin/smcled pointing to the protected installed executable.")
+    option("smcled --uninstall-user-cli", "Without sudo: remove only your ~/.local/bin/smcled shortcut.")
     option("sudo smcled --uninstall", "Stop the daemon, remove managed files and restore LED control.")
     option("sudo smcled --install 10", "Apple Silicon only: persist white brightness.")
     option("sudo smcled --install white 10", "Apple Silicon only: persist white brightness.")
@@ -2816,6 +2919,14 @@ func run(_ originalArguments: [String]) throws {
             mode = UInt8(arguments[1])!
         }
         try testAmberChannel(mode: mode)
+        return
+    case "--install-user-cli":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --install-user-cli (without sudo)") }
+        try manageUserCLILink()
+        return
+    case "--uninstall-user-cli":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --uninstall-user-cli (without sudo)") }
+        try manageUserCLILink(remove: true)
         return
     case "--status":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --status") }
