@@ -1,6 +1,6 @@
 # smcled
 
-Control the **status LED** of supported Mac mini and Mac Studio computers from Terminal. On verified Apple Silicon models, set white/amber brightness (0–255), select blinking patterns, or automate sunrise/sunset transitions. On the 2018 Intel T2 Mac mini, off/full-white/system-default and several manually dimmed levels have been physically verified. The full 0–255 manual range is available experimentally; amber remains under investigation.
+Control the **status LED** of supported Mac mini and Mac Studio computers from Terminal. On verified Apple Silicon models, set white/amber brightness (0–255), select blinking patterns, or automate sunrise/sunset transitions. On the 2018 Intel T2 Mac mini, off/full-white/system-default and several manually dimmed levels have been physically verified. The full 0–255 manual range and optional software fading are available experimentally; Intel amber is unsupported.
 
 Written in Swift using AppleSMC/IOKit. No third-party dependencies, SIP changes, or internet connection required.
 
