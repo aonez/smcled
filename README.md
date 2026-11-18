@@ -158,25 +158,36 @@ sudo ./smcled --uninstall          # Stop automation and restore native LED beha
 
 `--install-auto` creates a root-owned **one-shot system LaunchDaemon**, launched at startup and periodically (`StartInterval` defaults to 300 seconds). You can change the interval by running the install command again. When the LED resets after sleep or reboot, the next successful auto check should reapply the current scheduled level; transitions may lag by roughly the selected interval, and there is no resident wake listener.
 
-### Homebrew-managed or user-owned `/usr/local/bin`
+### Use `~/.local/bin` for the user CLI
 
-Some Intel Macs have a user-owned `/usr/local/bin` directory (often managed by Homebrew). smcled **never changes its ownership or permissions**. For security, it skips its optional `/usr/local/bin/smcled` symlink when that directory is absent, user-owned, or writable by non-root accounts. That condition **does not prevent installation** of the root-owned binary and LaunchDaemon, which invoke the binary by its absolute path.
+The installed daemon always executes the protected binary at `/Library/Application Support/smcled/smcled`. When `/usr/local/bin` is user-owned or writable by non-root accounts (for example, Homebrew installations), smcled skips the optional system PATH symlink; installation and the LaunchDaemon still work normally.
 
-If the installer reports that the PATH link was skipped, continue using the locally compiled `./smcled`, or call the installed executable directly (quotes are required due to the space in the path):
+To expose `smcled` as a shell command from any directory, **run without sudo** after `--install-auto`:
+
+```sh
+./smcled --install-user-cli
+```
+
+This creates only `~/.local/bin/smcled`, a per-user symbolic link to the protected installed executable. It refuses to overwrite unrelated files and never changes ownership of `/usr/local/bin`. You can remove just the per-user shortcut, even after uninstalling the daemon:
+
+```sh
+./smcled --uninstall-user-cli
+```
+
+If `~/.local/bin` isn't on your PATH, add the following to `~/.zprofile` once and reopen Terminal:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then unprivileged commands work as `smcled --status`, `smcled --auto-preview`, `smcled --help`. For privileged commands, prefer the **protected absolute path**, rather than trusting a user-writable PATH entry to resolve under `sudo`:
 
 ```sh
 sudo "/Library/Application Support/smcled/smcled" --auto-check
-"/Library/Application Support/smcled/smcled" --status
 sudo "/Library/Application Support/smcled/smcled" --uninstall
 ```
 
-Do **not** `chown` or `chmod` `/usr/local/bin` merely to create the optional link. A secure installation does not require that link, and `--status` explicitly reports whether it was installed or skipped.
-
-**Intel-specific limitations:** `--install-auto` is permitted on the verified `Macmini8,1` SMC fingerprint and always uses white. Fixed installs such as `sudo ./smcled --install white 50` remain disabled, and no Intel amber commands are issued. Installation, scheduled execution, wake recovery and uninstall have not yet been physically validated on Intel, even though the underlying manual white brightness/fade controls have been. Use `sudo ./smcled --uninstall` to stop the service and restore firmware-controlled white.
-
-Solar times are calculated offline using the city configured in macOS (`/Library/Preferences/.GlobalPreferences.plist`), with CoreBrightness as a fallback. No location permission is needed. These are undocumented system interfaces and could change in future macOS releases.
-
-Apple Silicon continues to support fixed startup modes, for example `sudo ./smcled --install amber 100`.
+Do not run `--install-user-cli` with `sudo` (that would address root's home directory). The root-managed install/uninstall process deliberately does not modify your personal shell profiles or per-user files.
 
 ## Check another Mac
 
