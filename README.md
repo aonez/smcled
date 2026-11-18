@@ -4,7 +4,7 @@ Control the **status LED** of supported Mac mini and Mac Studio computers from T
 
 Written in Swift using AppleSMC/IOKit. No third-party dependencies, SIP changes, or internet connection required.
 
-**Hardware verified:** M1 Mac mini (`Macmini9,1`) and M4 Max Mac Studio (`Mac16,9`) for manual white brightness and steady amber; 2018 Intel T2 Mac mini (`Macmini8,1`) for off, forced full-white, and restoration to normal white. Additional Intel brightness levels are available as experimental manual settings; no Intel persistent installation is enabled. Other M1–M4 models, and future Apple Silicon Mac mini/Studio models, require explicit experimental acknowledgement.
+**Hardware verified:** M1 Mac mini (`Macmini9,1`) and M4 Max Mac Studio (`Mac16,9`) for manual white brightness and steady amber; 2018 Intel T2 Mac mini (`Macmini8,1`) for off, forced full-white, and restoration to normal white. Additional Intel brightness levels are available, and the existing auto installer supports a white-only Intel profile. Fixed-mode installation remains unavailable on Intel. Other M1–M4 models, and future Apple Silicon Mac mini/Studio models, require explicit experimental acknowledgement.
 
 ## Build
 
@@ -38,9 +38,9 @@ The Intel Mac mini has **different SMC LED controls from Apple Silicon**. Physic
 | `sudo ./smcled --reset` (or `--intel-restore`, `--white`) | `LSRB=0`, reset `LSLB=FF FF` | Returns to firmware-controlled normal white with a fade; `LSPV=14 11` |
 | `./smcled --intel-led-status` | Read-only | Prints current Intel LED-related SMC registers |
 
-Intel LED commands require `sudo`, check the `Macmini8,1` model and exact SMC metadata/calibration, and confirm the observed SMC output. **Manual brightness now fades by default**, while `--no-fade` requests an immediate write; `--reset` uses the controller's normal restoration behavior. No Intel commands install a daemon or persist a boot preference. On the tested unit, `LSLN=2F FF`, `LSSV=08 6B`, and `LS! =00`; if your unit differs, write commands refuse to run until separately validated. A reported SMC state does not substitute for seeing the physical LED respond.
+Intel LED commands require `sudo`, check the `Macmini8,1` model and exact SMC metadata/calibration, and confirm the observed SMC output. **Manual brightness now fades by default**, while `--no-fade` requests an immediate write; `--reset` uses the controller's normal restoration behavior. Manual Intel commands do not change the saved preference; `--install-auto` explicitly installs a white-only LaunchDaemon. On the tested unit, `LSLN=2F FF`, `LSSV=08 6B`, and `LS! =00`; if your unit differs, write commands refuse to run until separately validated. A reported SMC state does not substitute for seeing the physical LED respond.
 
-**Intel 0–255 manual brightness is experimental.** `sudo ./smcled --intel-brightness 50`, `sudo ./smcled --white 50`, or `sudo ./smcled 50` set a live white PWM level via `LSLB=[value,value]` and `LSOO=1`; `0` uses the separately verified `LSOO=0` off command. `sudo ./smcled --reset` restores firmware-controlled normal white and the original `LSLB=FF FF`. Custom-to-custom updates now write `LSLB` **directly** while the manual override is active; from off, `LSLB` is configured before re-enabling the LED. This avoids the previous intermediate return to firmware-controlled normal brightness, which caused visible flashes at small brightness levels. The revised direct-transition path still needs physical confirmation. These values are not perceptually linear or photometrically calibrated. **Unsupported on Intel:** amber/color selection, `--install`, and `--install-auto`. White blinking tests remain separate from amber. Sleep/wake/restart behavior is untested.
+**Intel 0–255 manual brightness is experimental.** `sudo ./smcled --intel-brightness 50`, `sudo ./smcled --white 50`, or `sudo ./smcled 50` set a live white PWM level via `LSLB=[value,value]` and `LSOO=1`; `0` uses the separately verified `LSOO=0` off command. `sudo ./smcled --reset` restores firmware-controlled normal white and the original `LSLB=FF FF`. Custom-to-custom updates now write `LSLB` **directly** while the manual override is active; from off, `LSLB` is configured before re-enabling the LED. This avoids the previous intermediate return to firmware-controlled normal brightness, which caused visible flashes at small brightness levels. The revised direct-transition path was physically confirmed smooth, and the optional software fade was also tested successfully. These values are not perceptually linear or photometrically calibrated. **Unsupported on Intel:** amber/color selection and fixed-mode `--install`. The white-only `--install-auto` path is implemented but requires its first on-device installation test. White blinking tests remain separate from amber. Sleep/wake/restart behavior is untested.
 
 ### Intel variable-brightness research (physically observed)
 
@@ -73,7 +73,7 @@ sudo ./smcled --reset             # restore normal system-controlled white
 
 Run **one** test at a time and confirm normal LED brightness has returned before trying the next. Each test requires the observed baseline and restores the original `LSLB=FF FF` and normal LED mode. Previous versions restored `LSLB` *before* clearing the `LSOO` full-on override, briefly producing a maximum-white pulse; the revised diagnostic now calls `LSRB` and waits for normal PWM **before** restoring `LSLB`. This corrected restoration ordering was confirmed in the subsequent physical low/very-low/mid tests. If anything fails, stop and inspect the LED. Sudden crashes, power loss, and undocumented firmware behavior may prevent recovery.
 
-Arbitrary **0–255 manual** Intel brightness is enabled for experimental testing, with guards for the observed `Macmini8,1` calibration and live output. The 0–255 range and custom levels across multiple commands have not all been physically tested. The exact mapping is an 8-bit input replicated to a 16-bit preset; do not assume Apple Silicon brightness levels look identical. Persistent Intel installation is still disabled. If a write or restoration fails, stop and inspect the LED rather than repeating commands.
+Arbitrary **0–255 manual** Intel brightness is enabled for experimental testing, with guards for the observed `Macmini8,1` calibration and live output. The 0–255 range and custom levels across multiple commands have not all been physically tested. The exact mapping is an 8-bit input replicated to a 16-bit preset; do not assume Apple Silicon brightness levels look identical. Fixed-mode Intel installation remains disabled; white-only `--install-auto` is available for testing. If a write or restoration fails, stop and inspect the LED rather than repeating commands.
 
 ### Intel white-only flashing patterns
 
@@ -119,35 +119,49 @@ sudo ./smcled --fade 100 3          # Apple Silicon: explicit 3-second SOFTWARE 
 
 On both architectures, an explicit `--fade <level> [seconds]` with a supplied duration selects software easing. Duration overrides accept `0.01...15` seconds. Without an explicit duration, Intel applies proportional software fading and Apple Silicon uses native hardware behavior. `--fade` preserves the active color channel on Apple Silicon; bare numeric values and `--white` target white as before.
 
-**Automatic mode:** The existing Apple Silicon sunrise/sunset schedule still uses its independently implemented three-second software fades; its timing has *not* been changed. Intel has the PWM fade mechanism needed for a future **white-only** automatic mode, but Intel automation remains disabled pending a separate scheduling and wake/reboot design.
+**Automatic mode:** Apple Silicon keeps the existing sunrise/sunset scheduler and its three-second software fades unchanged. The Intel Mac mini now uses the same six scheduled brightness targets with **white only** (including originally amber stages), applying its previously tested proportional software fade. The Intel startup/periodic installation path is implemented but still requires on-device validation, particularly across reboot and sleep/wake.
 
 ## Automatic sunrise/sunset mode
 
-| Time | LED |
-|---|---|
-| Sunrise − 1 hour | Amber `100` |
-| Sunrise | White `33` |
-| Sunrise + 1 hour | White `255` |
-| Sunset | White `100` |
-| Sunset + 1 hour | Amber `255` |
-| Sunset + 4 hours | Amber `33` |
+The solar schedule uses the same six transitions on both supported hardware families. **Apple Silicon retains white/amber behavior**; the **2018 Intel Mac mini uses white only** at those exact brightness levels.
 
-For sunsets at **21:00 or later**, the last transition occurs after **3 hours** instead of 4. Changes use 3-second fades; color changes fade through darkness.
+| Solar event | Apple Silicon | Intel Mac mini 2018 |
+|---|---|---|
+| Sunrise − 1 hour | Amber `100` | White `100` |
+| Sunrise | White `33` | White `33` |
+| Sunrise + 1 hour | White `255` | White `255` |
+| Sunset | White `100` | White `100` |
+| Sunset + 1 hour | Amber `255` | White `255` |
+| Sunset + 4 hours | Amber `33` | White `33` |
+
+For sunsets at **21:00 or later**, the final event occurs **3 hours** after sunset instead of 4. Apple Silicon keeps its original **3-second software fades**, including fade-through-darkness when changing colors. Intel uses white-only proportional fades: a 255-level difference is one second, and smaller differences take the corresponding fraction. Actual timing can be affected by SMC transaction latency.
+
+### Preview and test safely
 
 ```sh
-./smcled --auto-preview           # Preview today's schedule; no LED changes
-sudo ./smcled --auto-check        # Apply the current state once
-sudo ./smcled --install-auto      # Enable automation (every 300 seconds)
-sudo ./smcled --install-auto 60   # Or customize interval (30–86400 seconds)
-./smcled --status                # Check installation and actual interval
-sudo smcled --uninstall           # Remove installation and reset LED
+./smcled --auto-preview           # Read-only schedule (Intel previews all events as white)
+sudo ./smcled --auto-check        # Apply the current scheduled state once
+./smcled --intel-led-status       # Intel only: inspect LED SMC readings
 ```
 
-Installation creates a one-shot system LaunchDaemon that runs at startup and periodically (default **300 seconds**). The optional interval is in seconds; to change it, rerun `--install-auto` with a new value. Transitions can be delayed by roughly the selected interval. No resident process is needed.
+**First Intel auto test:** Verify that the preview uses only white and that `--auto-check` sets the expected brightness. This does **not** install anything.
 
-Solar times are calculated offline using the city configured in macOS (`/Library/Preferences/.GlobalPreferences.plist`), with CoreBrightness as a fallback. No location permission is needed. These are undocumented system interfaces and may change in future macOS releases.
+### Install or remove automatic mode
 
-Fixed startup settings are also available, e.g. `sudo ./smcled --install amber 100`.
+```sh
+sudo ./smcled --install-auto      # Install checks every 300 seconds
+sudo ./smcled --install-auto 60   # Alternative: check every 60 seconds (30...86400)
+./smcled --status                # Report auto mode, interval, and loaded service
+sudo smcled --uninstall           # Stop automation and restore native LED behavior
+```
+
+`--install-auto` creates a root-owned **one-shot system LaunchDaemon**, launched at startup and periodically (`StartInterval` defaults to 300 seconds). You can change the interval by running the install command again. When the LED resets after sleep or reboot, the next successful auto check should reapply the current scheduled level; transitions may lag by roughly the selected interval, and there is no resident wake listener.
+
+**Intel-specific limitations:** `--install-auto` is permitted on the verified `Macmini8,1` SMC fingerprint and always uses white. Fixed installs such as `sudo ./smcled --install white 50` remain disabled, and no Intel amber commands are issued. Installation, scheduled execution, wake recovery and uninstall have not yet been physically validated on Intel, even though the underlying manual white brightness/fade controls have been. Use `sudo smcled --uninstall` to stop the service and restore firmware-controlled white.
+
+Solar times are calculated offline using the city configured in macOS (`/Library/Preferences/.GlobalPreferences.plist`), with CoreBrightness as a fallback. No location permission is needed. These are undocumented system interfaces and could change in future macOS releases.
+
+Apple Silicon continues to support fixed startup modes, for example `sudo ./smcled --install amber 100`.
 
 ## Check another Mac
 
@@ -168,7 +182,7 @@ sudo ./smcled --test-intel-brightness 100 --confirm-hardware-test  # Legacy seco
 
 Steady amber and white brightness have been physically verified on the M1 mini and M4 Max Studio. Flashing modes have only been tested on the M1 mini.
 
-**Intel Mac mini 2018 (`Macmini8,1`) has separately verified on/off/full-white control.** Its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. Physical tests of `LSLN` values `20 FF`, `40 FF`, and `2F 64` produced **no visible change**, even though `LSPV` followed these changes. See the Intel section above: selected dim levels are hardware-verified; experimental custom 0–255 manual brightness is available, while amber commands and installation remain disabled on Intel.
+**Intel Mac mini 2018 (`Macmini8,1`) has separately verified on/off/full-white control.** Its `LSLN=2F FF` differs from Apple Silicon, and it lacks channel telemetry. Physical tests of `LSLN` values `20 FF`, `40 FF`, and `2F 64` produced **no visible change**, even though `LSPV` followed these changes. See the Intel section above: selected dim levels are hardware-verified; experimental custom 0–255 manual brightness and white-only auto installation are available, while amber commands and fixed-mode installation remain disabled on Intel.
 
 **Intel multi-test workflow:** `--intel-suite` runs three 2-second probes on the first and second bytes in order: `2F FF → 20 FF`, `2F FF → 40 FF`, and `2F FF → 2F 64`. It restores and verifies `2F FF` after **each** test and aborts if restoration fails. `--intel-probe first|second <decimal-value>` lets you select additional probes without rebuilding; first-byte values are limited to **32–64**. `--intel-snapshot` reads related SMC keys without writing. Watch the LED during each stage; SMC readback alone does not prove any visual change.
 
@@ -185,7 +199,7 @@ sudo ./smcled --install-auto 300 --accept-untested-model
 
 - Startup recovery retries SMC initialization and LED writes together (up to 15 attempts), rather than giving up before the first check.
 - Requires `sudo` to change the LED; previews and status do not.
-- The tested Apple Silicon SMC controls cannot blend white and amber simultaneously; the Intel 2018 amber path remains unverified.
+- The tested Apple Silicon SMC controls cannot blend white and amber simultaneously; the Intel 2018 is treated as white-only; color/amber writes are disabled.
 - **Sleep resets the LED to fixed white at 255** on the tested Apple Silicon Mac mini. No wake listener is installed; after wake, the next scheduled check reapplies the correct state. Restoration is not necessarily immediate.
 - See [research.md](research.md) for SMC details and hardware tests.
 
