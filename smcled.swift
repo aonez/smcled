@@ -335,11 +335,9 @@ private let brightnessPreference = installDirectory + "/brightness"
 private let modePreference = installDirectory + "/mode"
 private let jobLabel = "dev.smcled.brightness"
 private let daemonPlist = "/Library/LaunchDaemons/" + jobLabel + ".plist"
-// A system-style PATH entry is a symlink to the privately installed executable.
-// Never write into /usr/bin (protected by SIP).
-private let cliParentDirectory = "/usr/local"
-private let cliBinDirectory = "/usr/local/bin"
-private let cliLink = cliBinDirectory + "/smcled"
+// Keep launchd's executable root-owned; configure the shell entry as the caller.
+private let cliPathExport = #"export PATH="$HOME/.local/bin:$PATH""#
+private let cliPathMarker = "# Added by smcled installer"
 
 func requireRoot() throws {
     #if os(macOS)
@@ -567,53 +565,116 @@ func setManagedPermissions(_ path: String, directory: Bool, executable: Bool = f
     ], ofItemAtPath: path)
 }
 
-// The CLI entry is an exact root-owned symlink to our installed executable.
-// Reject any unrelated path, symlink, or insecure parent rather than overwriting it.
-func validateCLILink() throws -> Bool {
+// User-facing setup runs without root privileges; launchd never follows
+// any executable or symlink in a user-writable directory.
+func userCLIPaths() throws -> (bin: String, link: String, profile: String) {
     #if os(macOS)
-    var attributes = stat()
-    if lstat(cliLink, &attributes) != 0 {
-        if errno == ENOENT { return false }
-        throw ToolError("Cannot inspect \(cliLink): errno \(errno)")
+    guard geteuid() != 0, let entry = getpwuid(geteuid()) else {
+        throw ToolError("User CLI setup must run without root privileges")
     }
-    guard (attributes.st_mode & mode_t(S_IFMT)) == mode_t(S_IFLNK),
-          attributes.st_uid == 0 else {
-        throw ToolError("Refusing unrelated or non-root-owned path at \(cliLink)")
-    }
-    let destination = try FileManager.default.destinationOfSymbolicLink(atPath: cliLink)
-    guard destination == installedExecutable else {
-        throw ToolError("Refusing unrelated symlink at \(cliLink) -> \(destination)")
-    }
-    return true
+    let home = String(cString: entry.pointee.pw_dir)
+    guard home.hasPrefix("/") else { throw ToolError("Invalid user home directory") }
+    let bin = home + "/.local/bin"
+    return (bin, bin + "/smcled", home + "/.zprofile")
     #else
-    throw ToolError("Installation requires macOS")
+    throw ToolError("User CLI setup requires macOS")
     #endif
 }
 
-// Our PATH directory must not be modifiable by non-root users, otherwise
-// a malicious replacement of `sudo smcled` could execute arbitrary code.
-func validateCLIParents(create: Bool) throws -> Bool {
-    let fm = FileManager.default
-    let localExists = try validateManagedPath(cliParentDirectory, directory: true)
-    if !localExists {
-        guard create else { return false }
-        try fm.createDirectory(atPath: cliParentDirectory, withIntermediateDirectories: false)
-        try setManagedPermissions(cliParentDirectory, directory: true)
+func validateUserCLILink(_ path: String) throws -> Bool {
+    #if os(macOS)
+    var attributes = stat()
+    if lstat(path, &attributes) != 0 {
+        if errno == ENOENT { return false }
+        throw ToolError("Cannot inspect \(path): errno \(errno)")
     }
-    let binExists = try validateManagedPath(cliBinDirectory, directory: true)
-    if !binExists {
-        guard create else { return false }
-        try fm.createDirectory(atPath: cliBinDirectory, withIntermediateDirectories: false)
-        try setManagedPermissions(cliBinDirectory, directory: true)
+    guard (attributes.st_mode & mode_t(S_IFMT)) == mode_t(S_IFLNK),
+          attributes.st_uid == geteuid() else {
+        throw ToolError("Refusing unrelated or non-owned CLI path: \(path)")
+    }
+    let destination = try FileManager.default.destinationOfSymbolicLink(atPath: path)
+    guard destination == installedExecutable else {
+        throw ToolError("Refusing unrelated CLI symlink: \(path) -> \(destination)")
     }
     return true
+    #else
+    throw ToolError("User CLI setup requires macOS")
+    #endif
 }
 
-func installCLILink() throws {
-    _ = try validateCLIParents(create: true)
-    guard !(try validateCLILink()) else { return }
-    try FileManager.default.createSymbolicLink(atPath: cliLink, withDestinationPath: installedExecutable)
-    guard try validateCLILink() else { throw ToolError("Failed to create managed PATH symlink") }
+// Check zsh's actual login/interactive PATH, not the sanitized sudo PATH.
+func shellAlreadyFindsUserBin() -> Bool {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    process.arguments = ["-lic", #"case ":$PATH:" in *":$HOME/.local/bin:"*) exit 0 ;; *) exit 1 ;; esac"#]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    } catch { return false }
+}
+
+func configureUserCLI() throws {
+    let paths = try userCLIPaths()
+    let fm = FileManager.default
+    try fm.createDirectory(atPath: paths.bin, withIntermediateDirectories: true)
+    if !(try validateUserCLILink(paths.link)) {
+        try fm.createSymbolicLink(atPath: paths.link, withDestinationPath: installedExecutable)
+    }
+
+    if !shellAlreadyFindsUserBin() {
+        let exists = fm.fileExists(atPath: paths.profile)
+        let current = exists ? try String(contentsOfFile: paths.profile, encoding: .utf8) : ""
+        if !current.contains(cliPathExport) {
+            if !exists && !fm.createFile(atPath: paths.profile, contents: nil) {
+                throw ToolError("Could not create \(paths.profile)")
+            }
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: paths.profile))
+            defer { try? handle.close() }
+            _ = try handle.seekToEnd()
+            let separator = current.isEmpty || current.hasSuffix("\n") ? "" : "\n"
+            let addition = separator + cliPathMarker + "\n" + cliPathExport + "\n"
+            try handle.write(contentsOf: Data(addition.utf8))
+            print("Added ~/.local/bin to ~/.zprofile (open a new Terminal session to use it).")
+        }
+    }
+    print("User CLI symlink: \(paths.link) -> \(installedExecutable)")
+}
+
+func removeUserCLI() throws {
+    let paths = try userCLIPaths()
+    if try validateUserCLILink(paths.link) {
+        try FileManager.default.removeItem(atPath: paths.link)
+        print("Removed user CLI symlink: \(paths.link)")
+    }
+    // Preserve the PATH entry: ~/.local/bin may contain other programs.
+}
+
+// Drop privileges before touching the caller's home or shell configuration.
+@discardableResult
+func runUserCLICommand(_ action: String) throws -> Bool {
+    #if os(macOS)
+    guard let value = ProcessInfo.processInfo.environment["SUDO_UID"],
+          let uid = uid_t(value), uid != 0,
+          let entry = getpwuid(uid) else {
+        print("No non-root sudo caller detected; configure ~/.local/bin for your user manually.")
+        return false
+    }
+    let username = String(cString: entry.pointee.pw_name)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+    process.arguments = ["-n", "-H", "-u", username, installedExecutable, action]
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw ToolError("Could not \(action) for user \(username) (exit \(process.terminationStatus))")
+    }
+    return true
+    #else
+    throw ToolError("User CLI setup requires macOS")
+    #endif
 }
 
 func executableSource() throws -> String {
@@ -687,12 +748,6 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     let _ = try validateManagedPath(brightnessPreference, directory: false)
     let _ = try validateManagedPath(modePreference, directory: false)
     let _ = try validateManagedPath(daemonPlist, directory: false)
-    // Validate the PATH destination before stopping any existing service.
-    // If /usr/local or /usr/local/bin already exists, it must be root-owned
-    // and not writable by other users.
-    let _ = try validateCLIParents(create: false)
-    let _ = try validateCLILink()
-
     // A reload is needed if the binary or plist changes.
     if jobIsLoaded() {
         _ = try callLaunchctl(["bootout", "system/" + jobLabel])
@@ -707,10 +762,10 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
     try writeManagedFile(brightnessPreference, data: Data("\(brightness)\n".utf8))
     try writeManagedFile(modePreference, data: Data("\(automatic ? "auto" : mode.rawValue)\n".utf8))
     try writeManagedFile(daemonPlist, data: createPlistData(automatic: automatic, interval: interval, acknowledged: !physicallyTestedDesktops.contains(modelID())))
-    try installCLILink()
     // A previously disabled service must be re-enabled explicitly.
     _ = try callLaunchctl(["enable", "system/" + jobLabel])
     _ = try callLaunchctl(["bootstrap", "system", daemonPlist])
+    let configuredCLI = try runUserCLICommand("--configure-user-cli")
 
     // RunAtLoad already starts the automatic fade. Do NOT duplicate that work
     // from this installer: two concurrent SMC fade loops would interfere.
@@ -719,7 +774,7 @@ func installBrightness(_ brightness: UInt8, mode: LEDMode = .white, automatic: B
           ? "Installed \(jobLabel); automatic sunrise/sunset mode (every \(interval) seconds)."
           : "Installed \(jobLabel); saved mode \(mode.rawValue), brightness \(brightness).")
     print("Boot-time job: \(daemonPlist)")
-    print("Shell command: \(cliLink) (sudo required to write)")
+    if configuredCLI { print("Shell command: ~/.local/bin/smcled (sudo required to write)") }
 }
 
 func readInstalledBrightness() throws -> UInt8 {
@@ -802,9 +857,6 @@ func uninstallBrightness() throws {
         }
     }
     let _ = try validateManagedPath(daemonPlist, directory: false)
-    let hasCLILink = try validateCLILink()
-    if hasCLILink { _ = try validateCLIParents(create: false) }
-
     if jobIsLoaded() {
         _ = try callLaunchctl(["bootout", "system/" + jobLabel])
     }
@@ -815,10 +867,12 @@ func uninstallBrightness() throws {
     } catch {
         writeStderr("WARNING: Could not restore LED brightness: \(error)\n")
     }
-    if hasCLILink { try fm.removeItem(atPath: cliLink) }
+    if hasDirectory && fm.fileExists(atPath: installedExecutable) {
+        _ = try runUserCLICommand("--remove-user-cli")
+    }
     if fm.fileExists(atPath: daemonPlist) { try fm.removeItem(atPath: daemonPlist) }
     if hasDirectory { try fm.removeItem(atPath: installDirectory) }
-    print("Uninstalled \(jobLabel), preferences, executable, and managed PATH link.")
+    print("Uninstalled \(jobLabel), preferences, executable, and user CLI link (if configured).")
 }
 
 func installationStatus() throws {
@@ -828,7 +882,12 @@ func installationStatus() throws {
     let plist = try validateManagedPath(daemonPlist, directory: false)
     print("Install: \(dir && binary && config && plist ? "complete" : "incomplete / not installed")")
     print("launchd loaded: \(jobIsLoaded() ? "yes" : "no")")
-    print("CLI PATH link: \((try validateCLILink()) ? cliLink : "not installed")")
+    if geteuid() != 0 {
+        let paths = try userCLIPaths()
+        print("User CLI link: \((try validateUserCLILink(paths.link)) ? paths.link : "not installed")")
+    } else {
+        print("User CLI link: check --status without sudo")
+    }
     if config {
         let installedMode = try readInstalledModeName()
         print("Configured mode: \(installedMode)")
@@ -1809,6 +1868,8 @@ func usage() {
       sudo smcled --test-zero             Reversible white/amber 0 test
       smcled --status                    Read configured settings; no sudo
       sudo smcled --uninstall            Remove daemon, files, symlink; reset LED
+      Installation links ~/.local/bin/smcled for the sudo caller and updates
+      ~/.zprofile only if ~/.local/bin is missing from the zsh login PATH.
 
       smcled --compatibility             Read-only hardware capability report
       smcled --sample-brightness         Read LSLN repeatedly, without writes
@@ -1883,6 +1944,14 @@ func run(_ originalArguments: [String]) throws {
     if ["--help", "help", "-h"].contains(command) { usage(); return }
     if command == "model" { print(modelID()); return }
     switch command {
+    case "--configure-user-cli":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --configure-user-cli") }
+        try configureUserCLI()
+        return
+    case "--remove-user-cli":
+        guard arguments.count == 1 else { throw ToolError("Usage: smcled --remove-user-cli") }
+        try removeUserCLI()
+        return
     case "--compatibility":
         guard arguments.count == 1 else { throw ToolError("Usage: smcled --compatibility") }
         try reportCompatibility()
