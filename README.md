@@ -51,6 +51,10 @@ sudo smcled --uninstall           # Remove installation and reset LED
 
 Installation creates a one-shot system LaunchDaemon that runs at startup and periodically (default **300 seconds**). The optional interval is in seconds; to change it, rerun `--install-auto` with a new value. Transitions can be delayed by roughly the selected interval. No resident process is needed.
 
+The installer also creates **`~/.local/bin/smcled`**, a symlink to the root-owned executable at `/Library/Application Support/smcled/smcled`, for the user who invoked `sudo`. It checks that user's zsh login PATH and, **only when `~/.local/bin` is missing**, appends `export PATH="$HOME/.local/bin:$PATH"` to `~/.zprofile`. Open a new Terminal session to pick up a new PATH entry. This avoids using `/usr/local/bin` and does not change the daemon's privileged executable path. Existing unrelated `~/.local/bin/smcled` files or symlinks are never overwritten.
+
+On `--uninstall`, the user's managed symlink is removed. The PATH line is deliberately retained, since other programs may use `~/.local/bin`. Run installation through `sudo` from your normal user account so the correct home directory is configured.
+
 Solar times are calculated offline using the city configured in macOS (`/Library/Preferences/.GlobalPreferences.plist`), with CoreBrightness as a fallback. No location permission is needed. These are undocumented system interfaces and may change in future macOS releases.
 
 Fixed startup settings are also available, e.g. `sudo ./smcled --install amber 100`.
